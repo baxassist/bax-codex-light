@@ -1,0 +1,8 @@
+Bax Codex Light Agent
+
+The Bax v1 protocol helpers in bax_codex_light/protocol.py are adapted from
+baxassist/bax-claude-code-lite-agent (Apache License 2.0).
+https://github.com/baxassist/bax-claude-code-lite-agent
+
+OpenAI Codex SDK, Python MCP SDK and websockets are separate dependencies
+distributed under their respective licenses.
