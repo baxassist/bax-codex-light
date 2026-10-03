@@ -1,9 +1,8 @@
 import asyncio
 
 import pytest
+from bax_codex_light.appserver import AppServer, RPCError, RPCRejected
 from conftest import FakeApp, until
-
-from bax_codex_light.appserver import AppServer, RPCError
 
 
 async def test_attach_uses_sdk_and_preserves_settings(tmp_path):
@@ -25,8 +24,9 @@ async def test_attach_uses_sdk_and_preserves_settings(tmp_path):
             assert len((await app.items("current", None, 50))["data"]) == 2
             await fake.emit("thread/status/changed", {"threadId": "current", "status": {"type": "idle"}})
             await until(lambda: bool(events))
-            with pytest.raises(RPCError, match="test"):
+            with pytest.raises(RPCRejected, match="test"):
                 await app.request("test/error", {})
+            assert not app.closed.is_set()
         finally:
             await app.close()
 

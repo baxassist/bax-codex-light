@@ -11,7 +11,7 @@ from bax_codex_light.bridge import Bridge
 from bax_codex_light.connection import FatalRelayError, Relay
 from bax_codex_light.protocol import sign
 from bax_codex_light.registry import Registration, Registry
-from conftest import FakeApp, until
+from conftest import FakeApp, entry, until
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from websockets.asyncio.server import serve
@@ -109,6 +109,77 @@ async def test_relay_rejects_identity_mismatch(tmp_path):
         with pytest.raises(FatalRelayError, match="другого агента"):
             await relay.session(unused, unused)
         assert not relay.connected
+
+
+async def test_busy_question_survives_history_and_relay_reconnect_then_runs_once(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.state = "active"
+    mobile = []
+    sockets = []
+    reg = None
+    question = "Какую модель ты используешь для тестов?"
+
+    async def relay_handler(ws):
+        await ws.recv()
+        await ws.send(json.dumps({"v": 1, "type": "challenge", "nonce": "n", "ts": 1}))
+        await ws.recv()
+        await ws.send(json.dumps({"v": 1, "type": "ready", "agent": reg.agent}))
+        sockets.append(ws)
+        await ws.send(json.dumps({"v": 1, "type": "subscribe"}))
+        async for raw in ws:
+            mobile.append(json.loads(raw))
+
+    def questions():
+        return [frame for frame in mobile if frame.get("kind") == "user" and frame.get("text") == question]
+
+    async with fake.running() as endpoint, serve(relay_handler, "127.0.0.1", 0) as server:
+        reg = registration(f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/agent")
+        registry = Registry(tmp_path / "registry.json")
+        registry.put(tmp_path, reg)
+        b = Bridge(tmp_path, registry, "current", endpoint)
+        try:
+            await b.start()
+            await until(lambda: any(frame.get("type") == "background" for frame in mobile))
+            await sockets[-1].send(json.dumps({"v": 1, "type": "run", "text": question}))
+            await until(lambda: len(questions()) == 1)
+            preview_id = questions()[0]["id"]
+            await sockets[-1].send(json.dumps({"v": 1, "type": "subscribe"}))
+            await until(lambda: len(questions()) == 2)
+            assert not fake.started.is_set()
+
+            await sockets[-1].close()
+            await until(lambda: len(sockets) == 2 and len(questions()) == 3)
+            assert {frame["id"] for frame in questions()} == {preview_id}
+            assert b.status()["queued"] == 1
+
+            fake.state = "idle"
+            await fake.emit("thread/status/changed", {"threadId": "current", "status": {"type": "idle"}})
+            await asyncio.wait_for(fake.started.wait(), 2)
+            starts = [call for call in fake.calls if call["method"] == "turn/start"]
+            assert len(starts) == 1
+            client_id = starts[0]["params"]["clientUserMessageId"]
+            native = entry("native-question", "userMessage", question)
+            native["item"]["clientId"] = client_id
+            fake.items.insert(0, native)
+            await fake.emit(
+                "item/completed",
+                {"threadId": "current", "turnId": "turn", "completedAtMs": 2, "item": native["item"]},
+            )
+            await until(lambda: not b.outbox)
+            assert questions()[-1]["id"] == preview_id
+
+            marker = len(mobile)
+            await sockets[-1].send(json.dumps({"v": 1, "type": "subscribe"}))
+            await until(lambda: any(frame.get("type") == "background" for frame in mobile[marker:]))
+            restored = [
+                frame
+                for frame in mobile[marker:]
+                if frame.get("kind") == "user" and frame.get("text") == question
+            ]
+            assert len(restored) == 1
+            assert len([call for call in fake.calls if call["method"] == "turn/start"]) == 1
+        finally:
+            await b.close()
 
 
 async def test_official_mcp_stdio_client_and_clean_eof(tmp_path):

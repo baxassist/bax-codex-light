@@ -1,10 +1,11 @@
 import asyncio
 
 import pytest
-
+from bax_codex_light.appserver import RPCRejected
 from bax_codex_light.bridge import Bridge
 from bax_codex_light.history import History
 from bax_codex_light.registry import Registry
+from conftest import entry
 
 
 class FakeApp:
@@ -14,6 +15,7 @@ class FakeApp:
         self.calls = []
         self.responses = []
         self.fail = False
+        self.history_items = []
 
     async def inspect(self, thread_id, project):
         return {"status": {"type": self.state, "activeFlags": []}}
@@ -27,6 +29,9 @@ class FakeApp:
 
     async def respond(self, request_id, result):
         self.responses.append((request_id, result))
+
+    async def items(self, thread_id, cursor, limit):
+        return {"data": self.history_items, "nextCursor": None}
 
 
 class FakeRelay:
@@ -72,6 +77,21 @@ async def test_busy_tasks_queue_without_steering_and_only_one_starts(tmp_path):
     assert b.app.calls[-1] == ("current", "второе")
 
 
+async def test_queued_question_survives_reopening_phone_history(tmp_path):
+    b = bridge(tmp_path)
+    question = "Какую модель ты используешь для тестов?"
+    await b.on_frame({"type": "run", "text": question})
+    echo = next(frame for frame in b.relay.sent if frame["type"] == "message")
+    b.relay.sent.clear()
+
+    await b.on_frame({"type": "subscribe"})
+
+    rows = [frame for frame in b.relay.sent if frame["type"] == "message"]
+    assert rows == [echo]
+    assert b.status()["queued"] == 1
+    assert not b.app.calls
+
+
 async def test_uncertain_delivery_never_auto_retries(tmp_path):
     b = bridge(tmp_path)
     b.app.state = "idle"
@@ -81,6 +101,102 @@ async def test_uncertain_delivery_never_auto_retries(tmp_path):
     assert len(b.app.calls) == 1
     assert not b.queue
     assert any(f.get("code") == "delivery_uncertain" for f in b.relay.sent)
+
+    b.relay.sent.clear()
+    await b.on_frame({"type": "subscribe"})
+    rows = [frame for frame in b.relay.sent if frame["type"] == "message"]
+    assert any(row["kind"] == "user" and row["text"] == "задача" for row in rows)
+    assert any(row["kind"] == "error" and "не подтверждена" in row["text"] for row in rows)
+    assert len(b.app.calls) == 1
+
+
+async def test_explicit_rejection_keeps_text_and_reason_without_retry(tmp_path):
+    b = bridge(tmp_path)
+    b.app.state = "idle"
+
+    async def rejected(thread_id, text, client_id):
+        b.app.calls.append((thread_id, text))
+        raise RPCRejected("Сессия не принимает прямые задачи")
+
+    b.app.start_turn = rejected
+    await b.on_frame({"type": "run", "text": "мой вопрос"})
+    await b.on_frame({"type": "subscribe"})
+    await b._drain()
+
+    assert b.app.calls == [("current", "мой вопрос")]
+    assert b.status()["delivery_errors"] == 1
+    assert any(frame.get("code") == "delivery_rejected" for frame in b.relay.sent)
+    assert any(frame.get("kind") == "error" and "не принимает" in frame["text"] for frame in b.relay.sent)
+    assert b.state == "ready"
+
+
+async def test_rejected_message_does_not_block_next_queued_message(tmp_path):
+    b = bridge(tmp_path)
+    await b.on_frame({"type": "run", "text": "отклонённое"})
+    await b.on_frame({"type": "run", "text": "следующее"})
+    original = b.app.start_turn
+
+    async def reject_first(thread_id, text, client_id):
+        if text == "отклонённое":
+            b.app.calls.append((thread_id, text))
+            raise RPCRejected("Запрос отклонён")
+        return await original(thread_id, text, client_id)
+
+    b.app.start_turn = reject_first
+    b.app.state = "idle"
+    await b._drain()
+    assert b.app.calls == [("current", "отклонённое"), ("current", "следующее")]
+    assert not b.queue
+
+
+async def test_late_native_confirmation_removes_uncertainty_without_retry(tmp_path):
+    b = bridge(tmp_path)
+    b.app.state = "idle"
+    b.app.fail = True
+    await b.on_frame({"type": "run", "text": "мой вопрос"})
+    client_id = next(iter(b.outbox))
+    echo = next(frame for frame in b.relay.sent if frame["type"] == "message")
+    native = entry("native", "userMessage", "мой вопрос")
+    native["item"]["clientId"] = client_id
+
+    await b.on_event({"method": "item/completed", "params": {"threadId": "current", "item": native["item"]}})
+    confirmation = [frame for frame in b.relay.sent if frame["type"] == "message"][-1]
+    assert confirmation["id"] == echo["id"]
+    b.app.history_items = [native]
+    b.relay.sent.clear()
+    await b.on_frame({"type": "subscribe"})
+
+    rows = [frame for frame in b.relay.sent if frame["type"] == "message"]
+    assert len(rows) == 1
+    assert rows[0]["text"] == "мой вопрос"
+    assert not b.outbox
+    assert b.status()["delivery_errors"] == 0
+    assert len(b.app.calls) == 1
+
+
+async def test_queued_echo_does_not_break_history_after_active_answer(tmp_path):
+    b = bridge(tmp_path)
+    b.app.history_items = [entry("old")]
+    await b.send_history()
+    await b.on_frame({"type": "run", "text": "вопрос в очереди"})
+    client_id = b.queue[0][0]
+    answer = entry("active-answer")
+    await b.on_event({"method": "item/completed", "params": {"threadId": "current", "item": answer["item"]}})
+    b.app.state = "idle"
+    await b._drain()
+    native = entry("native-question", "userMessage", "вопрос в очереди")
+    native["item"]["clientId"] = client_id
+    # Шаг пришёл при обрыве связи; в файле Codex вопрос идёт после активного ответа.
+    b.app.history_items = [native, entry("missed-step", "commandExecution"), answer, entry("old")]
+    b.relay.sent.clear()
+
+    await b.on_frame({"type": "subscribe"})
+
+    assert not any(frame["type"] == "error" for frame in b.relay.sent)
+    rows = [frame for frame in b.relay.sent if frame["type"] == "message"]
+    assert rows[-1]["text"] == "вопрос в очереди"
+    assert len([row for row in rows if row["kind"] == "user"]) == 1
+    assert not b.outbox
 
 
 def approval(thread_id="current", request_id=123, method="item/commandExecution/requestApproval"):

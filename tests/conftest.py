@@ -11,6 +11,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from bax_codex_light import __version__
+from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from websockets.asyncio.server import serve
 
 
@@ -90,6 +92,8 @@ class FakeApp:
             self.connections.discard(ws)
 
     async def emit(self, method, params, request_id=None):
+        if request_id is None and (model := NOTIFICATION_MODELS.get(method)):
+            model.model_validate(params)
         payload = {"method": method, "params": params}
         if request_id is not None:
             payload["id"] = request_id
@@ -139,7 +143,7 @@ def installed_plugin(tmp_path):
     assert settings["model"] == "user-choice"
     assert settings["mcp_servers"]["other"]["command"] == "/usr/bin/true"
     server = next(row for row in run("mcp", "list", "--json") if row["name"] == "bax_codex")
-    plugin = home / "plugins/cache/baxassist/bax-codex/0.3.0"
+    plugin = home / f"plugins/cache/baxassist/bax-codex/{__version__}"
     assert Path(server["transport"]["cwd"]).resolve() == plugin
     assert (plugin / "skills/connect/SKILL.md").is_file()
     yield server["transport"]

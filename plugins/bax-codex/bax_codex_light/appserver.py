@@ -23,6 +23,10 @@ class RPCError(RuntimeError):
     pass
 
 
+class RPCRejected(RPCError):
+    """Сервер явно отклонил запрос: в отличие от тайм-аута, ответ получен."""
+
+
 class AppServer:
     def __init__(self, endpoint: str | None = None, *, timeout: float = 20):
         self.endpoint = endpoint or str(Path.home() / ".codex/app-server-control/app-server-control.sock")
@@ -84,7 +88,9 @@ class AppServer:
                     future = self.pending.pop(message["id"], None)
                     if future is not None and not future.done():
                         if "error" in message:
-                            future.set_exception(RPCError(str(message["error"].get("message", "RPC error"))))
+                            future.set_exception(
+                                RPCRejected(str(message["error"].get("message", "RPC error")))
+                            )
                         else:
                             future.set_result(message.get("result", {}))
                 elif "method" in message:

@@ -37,15 +37,29 @@ class History:
         self.app = app
         self.thread_id = thread_id
         self.ids: dict[str, int] = {}
+        self.previews: dict[str, int] = {}
+        self.recorded: set[str] = set()
         self.low = self.high = 1 << 40
         self.initialized = False
         self.cursors: dict[int, str | None] = {}
 
     def live_id(self, item_id: str) -> int:
         if item_id not in self.ids:
-            self.high += 1 << 20
-            self.ids[item_id] = self.high
+            if item_id in self.previews:
+                self.ids[item_id] = self.previews.pop(item_id)
+                self.high = max(self.high, self.ids[item_id])
+            else:
+                self.high += 1 << 20
+                self.ids[item_id] = self.high
         return self.ids[item_id]
+
+    def preview_id(self, client_id: str) -> int:
+        """Эхо очереди ещё не задаёт позицию сообщения в настоящей истории Codex."""
+        if client_id not in self.previews:
+            # Оставляем место для событий ещё активного хода. high продвинется
+            # сюда только после настоящего появления сообщения в Codex.
+            self.previews[client_id] = max(self.high, max(self.previews.values(), default=0)) + (1 << 40)
+        return self.previews[client_id]
 
     async def page(self, before: int | None = None, limit: int = 50) -> list[dict]:
         if before is not None and before not in self.cursors:
@@ -65,6 +79,12 @@ class History:
             if not next_cursor or conversation_count >= limit:
                 break
         chronological = [identity(entry["item"]) for entry in reversed(entries)]
+        self.recorded.update(
+            identity(entry["item"]) for entry in entries if entry["item"].get("type") == "userMessage"
+        )
+        for item_id in chronological:
+            if item_id in self.previews:
+                self.live_id(item_id)
         self._assign(chronological, newest=before is None and self.initialized)
         self.initialized = True
         rows: list[dict] = []

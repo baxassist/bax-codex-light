@@ -1,6 +1,6 @@
 [project]
 name = "bax-codex-light-agent"
-version = "0.3.0"
+version = "0.3.1"
 description = "Связь Бакса с открытой сессией Codex через MCP и локальный app-server"
 requires-python = ">=3.11"
 readme = "README.md"

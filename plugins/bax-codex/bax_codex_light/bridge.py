@@ -6,17 +6,24 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from . import files
-from .appserver import AppServer, RPCError
+from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay
 from .history import History, identity, render
 from .registry import Registration, Registry
 
 log = logging.getLogger(__name__)
 SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read"]
+
+
+@dataclass
+class Submission:
+    text: str
+    error: str = ""
 
 
 class Bridge:
@@ -35,6 +42,8 @@ class Bridge:
         self.questions: dict[str, dict] = {}
         self.requests: dict[int | str, dict] = {}
         self.queue: deque[tuple[str, str]] = deque(maxlen=10)
+        # До появления настоящей userMessage в Codex эхо не является историей.
+        self.outbox: dict[str, Submission] = {}
         self.turn_id = ""
         self.streamed: set[str] = set()
         self.task: asyncio.Task | None = None
@@ -47,6 +56,8 @@ class Bridge:
             "state": self.state,
             "connected": bool(self.relay and self.relay.connected),
             "queued": len(self.queue),
+            "unconfirmed": len(self.outbox),
+            "delivery_errors": sum(bool(item.error) for item in self.outbox.values()),
             "pending_questions": len(self.questions),
             "error": self.error or (self.relay.error if self.relay else ""),
             "needs_thread": not bool(self.thread_id),
@@ -171,7 +182,28 @@ class Bridge:
     async def send_history(self, before: int | None = None, limit: int = 50) -> None:
         if not self.history:
             raise RPCError("Codex ещё не подключён")
-        for row in await self.history.page(before, limit):
+        rows = await self.history.page(before, limit)
+        for client_id in list(self.outbox):
+            if client_id in self.history.recorded:
+                self.outbox.pop(client_id)
+        if before is None:
+            for client_id, submission in self.outbox.items():
+                rows.append(
+                    {
+                        "id": self.history.preview_id(client_id),
+                        "kind": "user",
+                        "text": submission.text,
+                    }
+                )
+                if submission.error:
+                    rows.append(
+                        {
+                            "id": self.history.preview_id(client_id) + 1,
+                            "kind": "error",
+                            "text": submission.error,
+                        }
+                    )
+        for row in sorted(rows, key=lambda row: row["id"]):
             await self.send("message", **row)
 
     async def on_frame(self, frame: dict) -> None:
@@ -199,8 +231,9 @@ class Bridge:
                     raise RPCError("Сессия Codex недоступна")
                 client_id = str(uuid4())
                 self.queue.append((client_id, text))
+                self.outbox[client_id] = Submission(text)
                 # Эхо подтверждает приём в очередь для таймера доставки на телефоне.
-                await self.send("message", id=self.history.live_id(client_id), kind="user", text=text)
+                await self.send("message", id=self.history.preview_id(client_id), kind="user", text=text)
                 await self._drain()
             elif kind == "answer":
                 await self.answer(frame)
@@ -221,27 +254,42 @@ class Bridge:
 
     async def _drain(self) -> None:
         async with self.lock:
-            if not self.queue or not self.app:
-                return
-            thread = await self.app.inspect(self.thread_id, self.project)
-            self._set_state(thread["status"])
-            if self.state != "ready":
+            while self.queue and self.app:
+                thread = await self.app.inspect(self.thread_id, self.project)
+                self._set_state(thread["status"])
+                if self.state != "ready":
+                    await self.send("status", state=self.state)
+                    return
+                # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
+                client_id, text = self.queue.popleft()
+                self.state = "busy"
                 await self.send("status", state=self.state)
-                return
-            # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
-            client_id, text = self.queue.popleft()
-            self.state = "busy"
-            await self.send("status", state=self.state)
-            try:
-                result = await self.app.start_turn(self.thread_id, text, client_id)
-                self.turn_id = result["turn"]["id"]
-            except Exception:
-                await self.send(
-                    "error",
-                    code="delivery_uncertain",
-                    message="Доставка задачи не подтверждена. Проверьте разговор перед повторной отправкой",
-                )
-                raise
+                try:
+                    result = await self.app.start_turn(self.thread_id, text, client_id)
+                    self.turn_id = result["turn"]["id"]
+                    log.info("Codex: сообщение %s принято, ход %s", client_id, self.turn_id)
+                    return
+                except Exception as error:
+                    # Повтор требует решения человека; предварительное эхо остаётся
+                    # видимым до подтверждения настоящей историей Codex.
+                    message = (
+                        f"Codex отклонил сообщение: {error}"
+                        if isinstance(error, RPCRejected)
+                        else "Доставка задачи не подтверждена. Проверьте разговор перед повторной отправкой"
+                    )
+                    if submission := self.outbox.get(client_id):
+                        submission.error = message
+                    log.warning("Codex: доставка сообщения %s — %s", client_id, type(error).__name__)
+                    await self.send(
+                        "error",
+                        code="delivery_rejected" if isinstance(error, RPCRejected) else "delivery_uncertain",
+                        message=message,
+                    )
+                    if isinstance(error, RPCRejected):
+                        with contextlib.suppress(Exception):
+                            thread = await self.app.inspect(self.thread_id, self.project)
+                            self._set_state(thread["status"])
+                            await self.send("status", state=self.state)
 
     async def on_event(self, event: dict) -> None:
         params = event.get("params", {})
@@ -271,7 +319,11 @@ class Bridge:
             item = params["item"]
             view = render(item)
             if view and view[1]:
-                entry_id = self.history.live_id(identity(item))
+                item_id = identity(item)
+                if item.get("type") == "userMessage":
+                    self.history.recorded.add(item_id)
+                    self.outbox.pop(item_id, None)
+                entry_id = self.history.live_id(item_id)
                 # Готовый ответ заменяет потоковую строку с тем же ID.
                 await self.send("message", id=entry_id, kind=view[0], text=view[1])
                 self.streamed.add(item["id"])
