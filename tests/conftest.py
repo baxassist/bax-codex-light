@@ -179,4 +179,8 @@ def native_approval_schemas(tmp_path):
         }
         for family in ("Permissions", "CommandExecution", "FileChange")
     }
-    return {**families["Permissions"], "families": families}
+    user_input = {
+        name: json.loads((output / f"ToolRequestUserInput{name}.json").read_text())
+        for name in ("Params", "Response")
+    }
+    return {**families["Permissions"], "families": families, "user_input": user_input}

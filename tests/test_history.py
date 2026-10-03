@@ -52,3 +52,35 @@ async def test_missing_new_items_after_reconnect_keep_chronological_ids():
     assert history.ids["a"] == initial[-1]["id"]
     assert history.ids["u"] == initial[0]["id"]
     assert history.live_id("new") == updated[-1]["id"]
+
+
+async def test_async_questions_without_text_survive_history_reload():
+    item = {
+        "id": "question",
+        "type": "agentMessage",
+        "text": "",
+        "questions": [
+            {"title": "Что сделать?", "options": ["Проверить", "Исправить"]},
+            {"title": "Как назвать проект?"},
+        ],
+    }
+    pages = Pages({None: {"data": [{"item": item}], "nextCursor": None}})
+    history = History(pages, "current")
+    rows = await history.page()
+    assert rows[0]["text"] == "Что сделать?\n• Проверить\n• Исправить\n\nКак назвать проект?"
+    assert rows[0]["kind"] == "assistant"
+    assert await history.page() == rows
+
+
+def test_async_question_title_already_in_text_is_not_duplicated():
+    from bax_codex_light.history import render
+
+    assert render(
+        {
+            "type": "agentMessage",
+            "text": "Как назвать проект?",
+            "questions": [
+                {"title": "Как назвать проект?"},
+            ],
+        }
+    ) == ("assistant", "Как назвать проект?")

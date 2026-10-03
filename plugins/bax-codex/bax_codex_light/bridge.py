@@ -511,6 +511,7 @@ class Bridge:
                             "tool": "request_user_input",
                             "text": question["question"],
                             "options": options,
+                            "allow_custom_answer": not options or question.get("isOther") is True,
                             "input": {},
                             "rule": "",
                         },
@@ -576,10 +577,10 @@ class Bridge:
     async def async_questions(self, item: dict, turn_id: str) -> None:
         if item["id"] in self.seen_async_questions:
             return
-        self.seen_async_questions.add(item["id"])
-        questions = [q for q in item.get("questions") or [] if q.get("options")]
+        questions = item.get("questions") or []
         if not questions:
-            return  # На вопрос без вариантов отвечают обычным текстом в композере.
+            return
+        self.seen_async_questions.add(item["id"])
         request_id = f"async:{item['id']}"
         self.requests[request_id] = {
             "method": "agentMessage/asyncQuestion",
@@ -601,7 +602,8 @@ class Bridge:
                     "kind": "choice",
                     "tool": "request_user_input_async",
                     "text": question["title"],
-                    "options": question["options"],
+                    "options": question.get("options") or [],
+                    "allow_custom_answer": True,
                     "input": {},
                     "rule": "",
                 },
@@ -641,6 +643,8 @@ class Bridge:
             option = frame.get("option")
             if frame.get("verdict") != "choice" or not isinstance(option, str) or not option.strip():
                 raise ValueError("Нужен текст ответа на вопрос")
+            if not question["card"]["allow_custom_answer"] and option not in question["card"]["options"]:
+                raise ValueError("Выберите один из предложенных вариантов")
             request["answers"][question["field_id"]] = {"answers": [option]}
             self.questions.pop(qid)
             if any(other in self.questions for other in request["question_ids"]):

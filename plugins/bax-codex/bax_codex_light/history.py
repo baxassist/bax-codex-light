@@ -16,7 +16,13 @@ def render(item: dict) -> tuple[str, str] | None:
             part.get("text", "") for part in item.get("content", []) if part.get("type") == "text"
         )
     if kind == "agentMessage":
-        return "assistant", item.get("text", "")
+        text = item.get("text", "")
+        # В async-сообщении сам вопрос может быть только в questions, без text.
+        missing = [q for q in item.get("questions") or [] if q["title"] not in text]
+        questions = [
+            "\n".join([q["title"], *(f"• {option}" for option in q.get("options") or [])]) for q in missing
+        ]
+        return "assistant", "\n\n".join(filter(None, [text, *questions]))
     if kind == "commandExecution":
         return "tool", item.get("command", "Команда")
     if kind == "fileChange":
