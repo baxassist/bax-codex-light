@@ -42,6 +42,7 @@ class AppServer:
         self.handler: EventHandler | None = None
         self.closed = asyncio.Event()
         self.info: dict = {}
+        self.approvals: dict = {}
 
     async def open(self, handler: EventHandler | None = None) -> None:
         self.handler = handler
@@ -177,6 +178,11 @@ class AppServer:
         expected_project = await asyncio.to_thread(project.resolve)
         if result["thread"]["id"] != thread_id or result["thread"]["cwd"] != str(expected_project):
             raise RPCError("App-server подписал мост на другую сессию или проект")
+        self.approvals = {
+            "policy": result["approvalPolicy"],
+            "reviewer": result["approvalsReviewer"],
+            "manual": result["approvalsReviewer"] == "user" and result["approvalPolicy"] != "never",
+        }
         return result["thread"]
 
     async def items(self, thread_id: str, cursor: str | None, limit: int) -> dict:

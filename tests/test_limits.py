@@ -37,7 +37,7 @@ async def test_queue_overflow_is_rejected_without_losing_tasks(tmp_path):
 
 async def test_other_permission_request_is_never_answered(tmp_path):
     b = bridge(tmp_path)
-    await b.on_event(approval(method="item/permissions/requestApproval"))
+    await b.on_event(approval(method="item/unknown/requestApproval"))
     assert not b.questions
     assert not b.app.responses
     assert not b.relay.sent

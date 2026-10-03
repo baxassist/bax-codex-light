@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import __version__, files
+from .approvals import permission_details, permission_profile
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .history import History, identity, render
@@ -76,6 +77,7 @@ class Bridge:
             "error": error,
             "error_code": error_code,
             "keep_awake": self.relay.sleep_guard.status() if self.relay else None,
+            "approvals": self.app.approvals if self.app else None,
             "needs_thread": not bool(self.thread_id),
             "needs_registration": needs_registration,
         }
@@ -357,6 +359,7 @@ class Bridge:
                     self.requests.pop(request_id)
                     for qid in request["question_ids"]:
                         self.questions.pop(qid, None)
+                        await self.send("question.resolved", question_id=qid)
             await self.send("done", id=self.history.high if self.history else 0)
         elif method in {"item/started", "item/completed"} and self.history:
             item = params["item"]
@@ -393,14 +396,38 @@ class Bridge:
         if method not in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
             "item/tool/requestUserInput",
         }:
             return  # Другие виды разрешений остаются в локальном клиенте Codex.
-        if not all(isinstance(params.get(key), str) for key in ("threadId", "turnId", "itemId")):
+        if not all(
+            isinstance(params.get(key), str) and params[key] for key in ("threadId", "turnId", "itemId")
+        ):
+            return
+        if self.turn_id and params["turnId"] != self.turn_id:
             return
         if request_id in self.requests:
             return
-        self.requests[request_id] = {"method": method, "answers": {}, "question_ids": []}
+        permissions = None
+        if method == "item/permissions/requestApproval":
+            try:
+                if not isinstance(params.get("cwd"), str) or not Path(params["cwd"]).is_absolute():
+                    raise ValueError("Рабочий каталог должен быть абсолютным")
+                permissions = permission_profile(params.get("permissions"))
+            except ValueError:
+                log.warning("Codex запросил доступ в неподдерживаемом формате; запрос остаётся в Codex")
+                await self.send(
+                    "error",
+                    code="unsupported_permissions",
+                    message="Не удалось прочитать запрошенный доступ. Подтвердите этот запрос в самом Codex.",
+                )
+                return
+        self.requests[request_id] = {
+            "method": method,
+            "turn_id": params["turnId"],
+            "answers": {},
+            "question_ids": [],
+        }
         cards = []
         if method == "item/tool/requestUserInput":
             questions = params.get("questions", [])
@@ -422,10 +449,36 @@ class Bridge:
                         question["id"],
                     )
                 )
+        elif method == "item/permissions/requestApproval":
+            self.requests[request_id]["permissions"] = permissions
+            details = permission_details(permissions)
+            details["Рабочая папка"] = params["cwd"]
+            text = params.get("reason") or "Codex запрашивает дополнительный доступ к сети или файлам"
+            cards.append(
+                (
+                    {
+                        "kind": "permission",
+                        "tool": "Доступ к сети и файлам",
+                        "text": f"{text}\nРазрешение действует до окончания текущего хода.",
+                        "input": details,
+                        "options": [],
+                        "rule": "",
+                    },
+                    None,
+                )
+            )
         else:
             tool = "command" if "commandExecution" in method else "file_change"
             text = params.get("reason") or "Codex запрашивает разрешение на действие"
             details = {key: str(params[key]) for key in ("command", "cwd", "grantRoot") if params.get(key)}
+            if isinstance(params.get("networkApprovalContext"), dict):
+                network = params["networkApprovalContext"]
+                tool = "Доступ к сети"
+                details = {
+                    label: str(network[key])
+                    for key, label in (("host", "Адрес"), ("protocol", "Протокол"))
+                    if network.get(key)
+                }
             cards.append(
                 (
                     {
@@ -495,7 +548,13 @@ class Bridge:
         request_id = question["request_id"]
         request = self.requests[request_id]
         if frame.get("remember"):
-            raise ValueError("Разрешения выдаются только на одно действие")
+            raise ValueError("Постоянные разрешения с телефона не выдаются")
+        if (
+            request["method"] != "agentMessage/asyncQuestion"
+            and self.turn_id
+            and request["turn_id"] != self.turn_id
+        ):
+            raise ValueError("Этот запрос относится к уже завершённому ходу")
         if request["method"] == "agentMessage/asyncQuestion":
             if len(self.queue) == self.queue.maxlen:
                 raise ValueError("Очередь заполнена; дождитесь выполнения задач")
@@ -515,7 +574,13 @@ class Bridge:
             verdict = frame.get("verdict")
             if verdict not in {"allow", "deny"}:
                 raise ValueError("Нужен verdict allow или deny")
-            result = {"decision": "accept" if verdict == "allow" else "decline"}
+            if request["method"] == "item/permissions/requestApproval":
+                result = {
+                    "permissions": request["permissions"] if verdict == "allow" else {},
+                    "scope": "turn",
+                }
+            else:
+                result = {"decision": "accept" if verdict == "allow" else "decline"}
         if not self.app:
             raise RPCError("Codex не подключён")
         if request["method"] == "agentMessage/asyncQuestion":

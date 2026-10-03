@@ -50,6 +50,7 @@ class FakeApp:
         self.connections = set()
         self.items = [entry("a", text="Последний ответ"), entry("u", "userMessage", "Задача")]
         self.started = asyncio.Event()
+        self.approvals_reviewer = "user"
 
     async def handle(self, ws):
         self.connections.add(ws)
@@ -74,7 +75,7 @@ class FakeApp:
                         "model": "test",
                         "modelProvider": "openai",
                         "approvalPolicy": "on-request",
-                        "approvalsReviewer": "user",
+                        "approvalsReviewer": self.approvals_reviewer,
                         "sandbox": {"type": "readOnly"},
                     }
                 elif method == "thread/items/list":

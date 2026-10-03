@@ -18,6 +18,7 @@ class FakeApp:
         self.responses = []
         self.fail = False
         self.history_items = []
+        self.approvals = {}
 
     async def inspect(self, thread_id, project):
         return {"status": {"type": self.state, "activeFlags": []}}
