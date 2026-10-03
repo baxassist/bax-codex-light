@@ -39,6 +39,7 @@ class FakeApp:
 
 class FakeRelay:
     connected = True
+    keep_awake_enabled = True
     error = ""
     error_code = ""
     last_connected_at = None

@@ -60,7 +60,7 @@ def network_error(error: Exception, service: str) -> tuple[str, str]:
 
 
 class Relay:
-    def __init__(self, registration: Registration, project: Path, thread_id: str):
+    def __init__(self, registration: Registration, project: Path, thread_id: str, *, keep_awake: bool = True):
         self.registration = registration
         self.project = project
         self.thread_id = thread_id
@@ -75,6 +75,15 @@ class Relay:
         self.last_close_code: int | None = None
         self.last_close_reason = ""
         self.sleep_guard = IdleSleepGuard()
+        self.keep_awake_enabled = keep_awake
+
+    async def set_keep_awake(self, enabled: bool) -> None:
+        self.keep_awake_enabled = enabled
+        if enabled and self.connected:
+            await self.sleep_guard.start()
+        elif not enabled:
+            await self.sleep_guard.close()
+            self.sleep_guard.error = ""
 
     async def send(self, frame_type: str, **fields: Any) -> bool:
         if not self.connected or self.ws is None:
@@ -146,7 +155,8 @@ class Relay:
                 self.last_connected_at = time.time()
                 self.error = ""
                 self.error_code = ""
-                await self.sleep_guard.start()
+                if self.keep_awake_enabled:
+                    await self.sleep_guard.start()
                 await on_ready()
                 while True:
                     message = await self._receive()

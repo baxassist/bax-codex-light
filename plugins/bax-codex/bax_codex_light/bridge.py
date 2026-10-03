@@ -15,10 +15,11 @@ from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .history import History, identity, render
+from .preferences import Preferences
 from .registry import Registration, Registry
 
 log = logging.getLogger(__name__)
-SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read"]
+SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read", "power.get", "power.set"]
 
 
 @dataclass
@@ -33,6 +34,8 @@ class Bridge:
     ):
         self.project = project.resolve() if project else None
         self.registry = registry
+        self.preferences = Preferences(registry.path.with_name(f"{registry.path.stem}-settings.json"))
+        self.power_error = ""
         self.thread_id = thread_id
         self.endpoint = endpoint
         self.app: AppServer | None = None
@@ -76,7 +79,7 @@ class Bridge:
             "pending_questions": len(self.questions),
             "error": error,
             "error_code": error_code,
-            "keep_awake": self.relay.sleep_guard.status() if self.relay else None,
+            "keep_awake": self.power_settings() if self.relay else None,
             "relay_connection": {
                 "last_connected_at": self.relay.last_connected_at,
                 "last_disconnected_at": self.relay.last_disconnected_at,
@@ -156,7 +159,18 @@ class Bridge:
                 self._set_state(thread["status"])
                 self.history = self.history or History(self.app, self.thread_id)
                 self.history.app = self.app
-                self.relay = Relay(registration, self.project, self.thread_id)
+                keep_awake = True
+                try:
+                    keep_awake = await asyncio.to_thread(
+                        self.preferences.get, self.project, registration.agent
+                    )
+                    self.power_error = ""
+                except (OSError, ValueError, TypeError):
+                    self.power_error = (
+                        "Не удалось прочитать настройки агента. Защита от сна включена по умолчанию. "
+                        f"Проверьте файл {self.preferences.path}."
+                    )
+                self.relay = Relay(registration, self.project, self.thread_id, keep_awake=keep_awake)
                 self.error = ""
                 self.error_code = ""
                 relay_task = asyncio.create_task(self.relay.run(self.on_ready, self.on_frame))
@@ -219,8 +233,47 @@ class Bridge:
 
     async def on_ready(self) -> None:
         await self.send("caps", mode="lite", supports=SUPPORTS, remember=True)
+        await self.send("power.settings", **self.power_settings())
         await self.send("status", state=self.state)
         await self._drain()
+
+    def power_settings(self) -> dict:
+        if not self.relay:
+            return {"enabled": True, "supported": False, "active": False, "error": self.power_error}
+        return {
+            **self.relay.sleep_guard.status(),
+            "enabled": self.relay.keep_awake_enabled,
+            "error": self.power_error or self.relay.sleep_guard.error,
+        }
+
+    async def set_power(self, frame: dict) -> None:
+        error = ""
+        try:
+            enabled = frame.get("keep_awake")
+            if type(enabled) is not bool:
+                raise ValueError("Для защиты от сна нужен переключатель true или false")
+            if not self.relay or not self.project:
+                raise ValueError("Агент ещё не подключён; повторите после подключения")
+            agent = self.relay.registration.agent
+            if frame.get("agent", agent) != agent:
+                raise ValueError("Настройки относятся к другому агенту")
+            await asyncio.to_thread(self.preferences.put, self.project, agent, enabled)
+            self.power_error = ""
+            await self.relay.set_keep_awake(enabled)
+        except (OSError, ValueError, TypeError) as failure:
+            error = (
+                str(failure)
+                if isinstance(failure, ValueError)
+                else (
+                    "Не удалось сохранить настройку защиты от сна. "
+                    f"Проверьте доступ к {self.preferences.path}. "
+                    "Предыдущий выбор сохранён."
+                )
+            )
+        settings = self.power_settings()
+        await self.send(
+            "power.settings", **{**settings, "error": error or settings["error"]}, rid=frame.get("rid")
+        )
 
     async def send_history(self, before: int | None = None, limit: int = 50) -> None:
         if not self.history:
@@ -280,6 +333,10 @@ class Bridge:
                 await self._drain()
             elif kind == "answer":
                 await self.answer(frame)
+            elif kind == "power.get":
+                await self.send("power.settings", **self.power_settings(), rid=frame.get("rid"))
+            elif kind == "power.set":
+                await self.set_power(frame)
             elif kind == "files.list":
                 paths = await files.tracked(self.project)
                 await self.send(
