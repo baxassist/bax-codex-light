@@ -151,3 +151,32 @@ def installed_plugin(tmp_path):
     assert Path(server["transport"]["cwd"]).resolve() == plugin
     assert (plugin / "skills/connect/SKILL.md").is_file()
     yield server["transport"]
+
+
+@pytest.fixture
+def native_approval_schemas(tmp_path):
+    if not shutil.which("codex"):
+        pytest.skip("Нужен закреплённый CLI Codex 0.160.0")
+    home = tmp_path / "isolated-codex"
+    home.mkdir()
+    env = dict(os.environ, CODEX_HOME=str(home))
+    version = subprocess.run(["codex", "--version"], env=env, capture_output=True, text=True, check=True)
+    if "0.160.0" not in version.stdout:
+        pytest.skip("Проверка wire-схем закреплена на CLI 0.160.0")
+    output = tmp_path / "schema"
+    subprocess.run(
+        ["codex", "app-server", "generate-json-schema", "--experimental", "--out", str(output)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    families = {
+        family: {
+            name: json.loads((output / f"{family}RequestApproval{name}.json").read_text())
+            for name in ("Params", "Response")
+        }
+        for family in ("Permissions", "CommandExecution", "FileChange")
+    }
+    return {**families["Permissions"], "families": families}

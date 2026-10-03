@@ -7,6 +7,7 @@ import logging
 import re
 import socket
 import ssl
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,12 @@ class Relay:
         self.connected = False
         self.error = ""
         self.error_code = ""
+        self.reconnect_attempt = 0
+        self.retry_delay = 0
+        self.last_connected_at: float | None = None
+        self.last_disconnected_at: float | None = None
+        self.last_close_code: int | None = None
+        self.last_close_reason = ""
         self.sleep_guard = IdleSleepGuard()
 
     async def send(self, frame_type: str, **fields: Any) -> bool:
@@ -134,6 +141,9 @@ class Relay:
                 if ready.get("type") != "ready" or str(ready.get("agent")) != reg.agent:
                     raise FatalRelayError("Сервер вернул другого агента")
                 self.connected = True
+                self.reconnect_attempt = 0
+                self.retry_delay = 0
+                self.last_connected_at = time.time()
                 self.error = ""
                 self.error_code = ""
                 await self.sleep_guard.start()
@@ -145,13 +155,14 @@ class Relay:
                     elif message.get("type") != "pong":
                         await on_frame(message)
             finally:
+                if self.connected:
+                    self.last_disconnected_at = time.time()
                 self.connected = False
                 self.ws = None
 
     async def run(
         self, on_ready: Callable[[], Awaitable[None]], on_frame: Callable[[dict], Awaitable[None]]
     ) -> None:
-        attempt = 0
         try:
             while True:
                 try:
@@ -167,9 +178,18 @@ class Relay:
                     log.warning("%s; переподключение", self.error)
                 except Exception as error:
                     self.error_code, self.error = network_error(error, "релею Бакса")
+                    if isinstance(error, ConnectionClosed):
+                        close = error.rcvd or error.sent
+                        self.last_close_code = close.code if close else None
+                        reason = close.reason if close else ""
+                        self.last_close_reason = " ".join(
+                            reason.replace(self.registration.secret, "[секрет скрыт]").split()
+                        )[:200]
                     log.warning("%s", self.error)
-                await asyncio.sleep(backoff(attempt))
-                attempt += 1
+                self.retry_delay = backoff(self.reconnect_attempt)
+                await asyncio.sleep(self.retry_delay)
+                self.retry_delay = 0
+                self.reconnect_attempt += 1
         finally:
             await self.sleep_guard.close()
 

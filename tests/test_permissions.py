@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import subprocess
 from pathlib import Path
 
 import jsonschema
@@ -44,8 +41,6 @@ async def test_phone_grants_only_requested_access_for_current_turn(tmp_path, ver
     assert str(tmp_path / "write") in card["input"].values()
     assert "Сеть" in card["input"]
     qid = card["question_id"]
-    with pytest.raises(ValueError):
-        await b.answer({"question_id": qid, "verdict": verdict, "remember": True})
     await b.answer(
         {
             "question_id": qid,
@@ -150,8 +145,8 @@ async def test_managed_network_approval_shows_host_and_protocol(tmp_path):
     assert card["input"] == {"Адрес": "example.test", "Протокол": "https"}
 
 
-@pytest.mark.parametrize("verdict", ["allow", "deny"])
-async def test_permission_round_trip_over_native_codex_and_relay_websockets(tmp_path, verdict):
+@pytest.mark.parametrize("verdict,remember", [("allow", False), ("deny", False), ("allow", True)])
+async def test_permission_round_trip_over_native_codex_and_relay_websockets(tmp_path, verdict, remember):
     fake = FakeApp(tmp_path)
     mobile, sockets = [], []
     reg = None
@@ -178,14 +173,22 @@ async def test_permission_round_trip_over_native_codex_and_relay_websockets(tmp_
             await until(lambda: any(frame.get("type") == "question" for frame in mobile))
             card = next(frame for frame in mobile if frame["type"] == "question")
             await sockets[0].send(
-                json.dumps({"v": 1, "type": "answer", "question_id": card["question_id"], "verdict": verdict})
+                json.dumps(
+                    {
+                        "v": 1,
+                        "type": "answer",
+                        "question_id": card["question_id"],
+                        "verdict": verdict,
+                        "remember": remember,
+                    }
+                )
             )
             await until(lambda: bool(fake.responses))
             assert fake.responses[-1] == {
                 "id": 88,
                 "result": {
                     "permissions": params["permissions"] if verdict == "allow" else {},
-                    "scope": "turn",
+                    "scope": "session" if remember else "turn",
                 },
             }
             assert b.status()["approvals"] == {"policy": "on-request", "reviewer": "user", "manual": True}
@@ -212,31 +215,6 @@ async def test_attach_reports_review_mode_without_overriding_it(tmp_path, review
             assert resume["params"] == {"threadId": "current", "excludeTurns": True}
         finally:
             await app.close()
-
-
-@pytest.fixture
-def native_approval_schemas(tmp_path):
-    if not shutil.which("codex"):
-        pytest.skip("Нужен закреплённый CLI Codex 0.160.0")
-    home = tmp_path / "isolated-codex"
-    home.mkdir()
-    env = dict(os.environ, CODEX_HOME=str(home))
-    version = subprocess.run(["codex", "--version"], env=env, capture_output=True, text=True, check=True)
-    if "0.160.0" not in version.stdout:
-        pytest.skip("Проверка wire-схем закреплена на CLI 0.160.0")
-    output = tmp_path / "schema"
-    subprocess.run(
-        ["codex", "app-server", "generate-json-schema", "--out", str(output)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=True,
-    )
-    return {
-        name: json.loads((output / f"PermissionsRequestApproval{name}.json").read_text())
-        for name in ("Params", "Response")
-    }
 
 
 @pytest.mark.parametrize("verdict", ["allow", "deny"])

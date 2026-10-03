@@ -41,6 +41,11 @@ class FakeRelay:
     connected = True
     error = ""
     error_code = ""
+    last_connected_at = None
+    last_disconnected_at = None
+    last_close_code = None
+    last_close_reason = ""
+    retry_delay = 0
 
     def __init__(self):
         self.sent = []
@@ -240,13 +245,11 @@ async def test_unrelated_events_and_requests_are_ignored(tmp_path):
 
 
 @pytest.mark.parametrize("verdict,decision", [("allow", "accept"), ("deny", "decline")])
-async def test_no_auto_approval_or_persistent_grants(tmp_path, verdict, decision):
+async def test_one_time_answer_never_auto_grants_or_remembers(tmp_path, verdict, decision):
     b = bridge(tmp_path)
     await b.on_event(approval())
     assert not b.app.responses
     question_id = next(iter(b.questions))
-    with pytest.raises(ValueError):
-        await b.answer({"question_id": question_id, "verdict": verdict, "remember": True})
     await b.answer({"question_id": question_id, "verdict": verdict})
     assert b.app.responses == [(123, {"decision": decision})]
     with pytest.raises(ValueError):

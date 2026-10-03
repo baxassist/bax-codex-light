@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import __version__, files
-from .approvals import permission_details, permission_profile
+from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .history import History, identity, render
@@ -77,6 +77,15 @@ class Bridge:
             "error": error,
             "error_code": error_code,
             "keep_awake": self.relay.sleep_guard.status() if self.relay else None,
+            "relay_connection": {
+                "last_connected_at": self.relay.last_connected_at,
+                "last_disconnected_at": self.relay.last_disconnected_at,
+                "last_close_code": self.relay.last_close_code,
+                "last_close_reason": self.relay.last_close_reason,
+                "next_retry_seconds": self.relay.retry_delay,
+            }
+            if self.relay
+            else None,
             "approvals": self.app.approvals if self.app else None,
             "needs_thread": not bool(self.thread_id),
             "needs_registration": needs_registration,
@@ -209,7 +218,7 @@ class Bridge:
         return False
 
     async def on_ready(self) -> None:
-        await self.send("caps", mode="lite", supports=SUPPORTS, remember=False)
+        await self.send("caps", mode="lite", supports=SUPPORTS, remember=True)
         await self.send("status", state=self.state)
         await self._drain()
 
@@ -428,6 +437,8 @@ class Bridge:
             "answers": {},
             "question_ids": [],
         }
+        remembered = remember_approval(method, params, permissions)
+        self.requests[request_id]["remembered"] = remembered
         cards = []
         if method == "item/tool/requestUserInput":
             questions = params.get("questions", [])
@@ -459,7 +470,7 @@ class Bridge:
                     {
                         "kind": "permission",
                         "tool": "Доступ к сети и файлам",
-                        "text": f"{text}\nРазрешение действует до окончания текущего хода.",
+                        "text": f"{text}\n«Разрешить» — до окончания текущего хода.",
                         "input": details,
                         "options": [],
                         "rule": "",
@@ -493,6 +504,12 @@ class Bridge:
                 )
             )
         for card, field_id in cards:
+            if card["kind"] == "permission":
+                card["remember"] = remembered is not None
+                card["remember_label"] = remembered.label if remembered else ""
+                card["rule"] = remembered.rule if remembered else ""
+                if remembered:
+                    card["text"] += f"\n«{remembered.label}»: {remembered.rule}."
             qid = str(uuid4())
             card["question_id"] = qid
             self.requests[request_id]["question_ids"].append(qid)
@@ -547,8 +564,11 @@ class Bridge:
             raise ValueError("Вопрос уже решён или относится к другой сессии")
         request_id = question["request_id"]
         request = self.requests[request_id]
-        if frame.get("remember"):
-            raise ValueError("Постоянные разрешения с телефона не выдаются")
+        remember = frame.get("remember", False)
+        if not isinstance(remember, bool):
+            raise ValueError("Нужен логический признак сохранения разрешения")
+        if remember and (frame.get("verdict") != "allow" or not request.get("remembered")):
+            raise ValueError("Codex не предложил сохранение разрешения для этого запроса")
         if (
             request["method"] != "agentMessage/asyncQuestion"
             and self.turn_id
@@ -574,7 +594,9 @@ class Bridge:
             verdict = frame.get("verdict")
             if verdict not in {"allow", "deny"}:
                 raise ValueError("Нужен verdict allow или deny")
-            if request["method"] == "item/permissions/requestApproval":
+            if remember:
+                result = request["remembered"].response
+            elif request["method"] == "item/permissions/requestApproval":
                 result = {
                     "permissions": request["permissions"] if verdict == "allow" else {},
                     "scope": "turn",
