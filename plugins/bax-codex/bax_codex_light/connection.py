@@ -15,6 +15,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from . import __version__
+from .power import IdleSleepGuard
 from .protocol import backoff, frame, parse, sign
 from .registry import Registration
 
@@ -66,6 +67,7 @@ class Relay:
         self.connected = False
         self.error = ""
         self.error_code = ""
+        self.sleep_guard = IdleSleepGuard()
 
     async def send(self, frame_type: str, **fields: Any) -> bool:
         if not self.connected or self.ws is None:
@@ -134,6 +136,7 @@ class Relay:
                 self.connected = True
                 self.error = ""
                 self.error_code = ""
+                await self.sleep_guard.start()
                 await on_ready()
                 while True:
                     message = await self._receive()
@@ -149,24 +152,28 @@ class Relay:
         self, on_ready: Callable[[], Awaitable[None]], on_frame: Callable[[dict], Awaitable[None]]
     ) -> None:
         attempt = 0
-        while True:
-            try:
-                await self.session(on_ready, on_frame)
-            except FatalRelayError as error:
-                self.error = str(error)
-                self.error_code = error.code
-                log.error("%s", self.error)
-                return
-            except RelayResponseError as error:
-                self.error = str(error)
-                self.error_code = error.code
-                log.warning("%s; переподключение", self.error)
-            except Exception as error:
-                self.error_code, self.error = network_error(error, "релею Бакса")
-                log.warning("%s", self.error)
-            await asyncio.sleep(backoff(attempt))
-            attempt += 1
+        try:
+            while True:
+                try:
+                    await self.session(on_ready, on_frame)
+                except FatalRelayError as error:
+                    self.error = str(error)
+                    self.error_code = error.code
+                    log.error("%s", self.error)
+                    return
+                except RelayResponseError as error:
+                    self.error = str(error)
+                    self.error_code = error.code
+                    log.warning("%s; переподключение", self.error)
+                except Exception as error:
+                    self.error_code, self.error = network_error(error, "релею Бакса")
+                    log.warning("%s", self.error)
+                await asyncio.sleep(backoff(attempt))
+                attempt += 1
+        finally:
+            await self.sleep_guard.close()
 
     async def close(self) -> None:
+        await self.sleep_guard.close()
         if self.ws is not None:
             await self.ws.close()

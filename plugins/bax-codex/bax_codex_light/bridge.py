@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from . import files
+from . import __version__, files
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .history import History, identity, render
@@ -64,6 +64,7 @@ class Bridge:
             )
             error_code = "registration_unavailable"
         return {
+            "plugin_version": __version__,
             "project": str(self.project) if self.project else None,
             "thread_id": self.thread_id or None,
             "state": self.state,
@@ -74,6 +75,7 @@ class Bridge:
             "pending_questions": len(self.questions),
             "error": error,
             "error_code": error_code,
+            "keep_awake": self.relay.sleep_guard.status() if self.relay else None,
             "needs_thread": not bool(self.thread_id),
             "needs_registration": needs_registration,
         }
