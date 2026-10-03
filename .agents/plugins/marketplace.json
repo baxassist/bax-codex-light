@@ -1,0 +1,12 @@
+{
+  "name": "baxassist",
+  "interface": {"displayName": "Бакс"},
+  "plugins": [
+    {
+      "name": "bax-codex",
+      "source": {"source": "local", "path": "./plugins/bax-codex"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"},
+      "category": "Productivity"
+    }
+  ]
+}

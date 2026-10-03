@@ -13,7 +13,7 @@ from . import files
 from .appserver import AppServer, RPCError
 from .connection import Relay
 from .history import History, identity, render
-from .registry import Registry
+from .registry import Registration, Registry
 
 log = logging.getLogger(__name__)
 SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read"]
@@ -50,7 +50,7 @@ class Bridge:
             "pending_questions": len(self.questions),
             "error": self.error or (self.relay.error if self.relay else ""),
             "needs_thread": not bool(self.thread_id),
-            "needs_pairing": bool(self.project and not self.registry.get(self.project)),
+            "needs_registration": bool(self.project and not self.registry.get(self.project)),
         }
 
     async def start(self) -> None:
@@ -84,16 +84,25 @@ class Bridge:
             await self.start()
             return self.status()
 
-    async def pair(self, code: str, api: str) -> dict:
-        from .pairing import redeem
-
+    async def connect(self, key: str, server: str = "wss://relay.baxassist.com/agent") -> dict:
         async with self.lock:
             if not self.thread_id or self.project is None:
                 raise ValueError("Сначала вызовите bax_attach с точным CODEX_THREAD_ID этого разговора")
-            if self.registry.get(self.project):
-                raise ValueError("Этот проект уже подключён. Существующая регистрация сохранена")
-            registration = await redeem(code, api)
+            registration = Registration.from_key(key, server)
+            previous = self.registry.get(self.project)
+            if previous and previous.agent != registration.agent:
+                raise ValueError("Проект подключён к другому агенту. Существующая регистрация сохранена")
+            changed = previous and (
+                previous.key_id != registration.key_id
+                or previous.secret != registration.secret
+                or previous.server != registration.server
+            )
             self.registry.put(self.project, registration)
+            if changed and self.task is not None:
+                self.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.task
+                self.task = None
             if self.task is not None and self.task.done():
                 self.task = None
             await self.start()
@@ -106,7 +115,7 @@ class Bridge:
             try:
                 registration = self.registry.get(self.project)
                 if not registration:
-                    self.error = "Нет регистрации. Получите код подключения в Баксе и вызовите bax_pair"
+                    self.error = "Нет регистрации. Вставьте команду из Бакса и вызовите bax_connect"
                     return
                 self.app = AppServer(self.endpoint)
                 await self.app.open(self.on_event)

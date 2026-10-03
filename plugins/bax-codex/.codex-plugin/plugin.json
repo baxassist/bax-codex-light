@@ -1,11 +1,11 @@
 {
   "name": "bax-codex",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Связь текущего разговора Codex с Баксом на телефоне",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Бакс",
+    "displayName": "Bax Codex Lite",
     "shortDescription": "Задачи с телефона в текущий разговор Codex",
     "category": "Productivity"
   }

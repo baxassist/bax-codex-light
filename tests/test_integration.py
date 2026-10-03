@@ -7,15 +7,14 @@ import sys
 from uuid import uuid4
 
 import pytest
-from conftest import FakeApp, until
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from websockets.asyncio.server import serve
-
 from bax_codex_light.bridge import Bridge
 from bax_codex_light.connection import FatalRelayError, Relay
 from bax_codex_light.protocol import sign
 from bax_codex_light.registry import Registration, Registry
+from conftest import FakeApp, until
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from websockets.asyncio.server import serve
 
 
 def registration(server):
@@ -132,7 +131,7 @@ async def test_official_mcp_stdio_client_and_clean_eof(tmp_path):
         initialize = await session.initialize()
         assert initialize.server_info.name == "bax-codex-light"
         tools = await session.list_tools()
-        assert {tool.name for tool in tools.tools} == {"bax_status", "bax_attach", "bax_pair"}
+        assert {tool.name for tool in tools.tools} == {"bax_status", "bax_attach", "bax_connect"}
         response = await session.call_tool("bax_status", {})
         assert not response.is_error
         assert response.structured_content["needs_thread"] is True

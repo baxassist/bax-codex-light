@@ -1,4 +1,4 @@
-"""Регистрация через CLI отделена от инструментов, доступных модели Codex."""
+"""Ручные команды для разработки; подключение плагина доступно через MCP."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from . import __version__
 from .appserver import AppServer
 from .bridge import Bridge
 from .mcp_server import create_server
-from .pairing import DEFAULT_API
 from .registry import Registration, Registry
 
 
@@ -23,8 +22,6 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Связь Бакса с уже открытой сессией Codex")
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
-    installer = commands.add_parser("install-macos")
-    installer.add_argument("--app-path", type=Path, required=True)
     for command in ("connect", "status", "doctor", "serve"):
         child = commands.add_parser(command)
         child.add_argument(
@@ -43,7 +40,6 @@ def parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="Взять каталог из точного открытого разговора при attach",
             )
-            child.add_argument("--api", default=os.environ.get("BAX_CODEX_API", DEFAULT_API))
         if command == "doctor":
             child.add_argument(
                 "--check-history", action="store_true", help="Проверить чтение истории без вывода текста"
@@ -91,11 +87,6 @@ def main() -> None:
     args = parser().parse_args()
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(name)s: %(message)s")
     try:
-        if args.command == "install-macos":
-            from .install_macos import install
-
-            print(json.dumps(install(args.app_path), ensure_ascii=False))
-            return
         if not args.project.is_dir():
             raise ValueError("Каталог проекта не существует")
         registry = Registry(args.registry)
@@ -131,7 +122,7 @@ def main() -> None:
             bridge = Bridge(
                 None if args.auto_project else args.project, registry, args.thread, args.app_server
             )
-            asyncio.run(create_server(bridge, args.api).run_stdio_async())
+            asyncio.run(create_server(bridge).run_stdio_async())
     except (OSError, ValueError, RuntimeError, TimeoutError) as error:
         print(f"bax-codex-light: {error}", file=sys.stderr)
         raise SystemExit(1) from None

@@ -13,6 +13,6 @@
 - Не править глобальные конфиги Codex, сервер и iOS Бакса при изменении этого пакета.
 - Не публиковать пакет и не создавать remote без отдельного запроса.
 
-Проверки: `uv sync --locked`, `.venv/bin/ruff check bax_codex_light tests`,
-`.venv/bin/ruff format --check bax_codex_light tests`, `.venv/bin/pytest tests -q`.
+Проверки: `uv sync --locked`, `.venv/bin/ruff check plugins tests`,
+`.venv/bin/ruff format --check plugins tests`, `.venv/bin/pytest tests -q`.
 Сетевые тесты могут требовать разрешение sandbox на loopback.
