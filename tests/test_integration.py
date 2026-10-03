@@ -7,14 +7,15 @@ import sys
 from uuid import uuid4
 
 import pytest
-from bax_codex_light.bridge import Bridge
-from bax_codex_light.connection import FatalRelayError, Relay
-from bax_codex_light.protocol import sign
-from bax_codex_light.registry import Registration, Registry
 from conftest import FakeApp, entry, until
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from websockets.asyncio.server import serve
+
+from bax_codex_light.bridge import Bridge
+from bax_codex_light.connection import FatalRelayError, Relay
+from bax_codex_light.protocol import sign
+from bax_codex_light.registry import Registration, Registry
 
 
 def registration(server):

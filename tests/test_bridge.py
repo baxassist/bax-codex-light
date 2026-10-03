@@ -1,11 +1,12 @@
 import asyncio
 
 import pytest
+from conftest import entry
+
 from bax_codex_light.appserver import RPCRejected
 from bax_codex_light.bridge import Bridge
 from bax_codex_light.history import History
 from bax_codex_light.registry import Registry
-from conftest import entry
 
 
 class FakeApp:

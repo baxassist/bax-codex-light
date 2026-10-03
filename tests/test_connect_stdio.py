@@ -5,12 +5,13 @@ import sys
 from uuid import uuid4
 
 import pytest
-from bax_codex_light.protocol import sign
-from bax_codex_light.registry import Registry
 from conftest import FakeApp, until
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from websockets.asyncio.server import serve
+
+from bax_codex_light.protocol import sign
+from bax_codex_light.registry import Registry
 
 
 @pytest.mark.parametrize("packaged", [False, True])

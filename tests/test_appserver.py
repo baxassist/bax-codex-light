@@ -1,8 +1,9 @@
 import asyncio
 
 import pytest
-from bax_codex_light.appserver import AppServer, RPCError, RPCRejected
 from conftest import FakeApp, until
+
+from bax_codex_light.appserver import AppServer, RPCError, RPCRejected
 
 
 async def test_attach_uses_sdk_and_preserves_settings(tmp_path):

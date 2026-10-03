@@ -3,9 +3,10 @@ import json
 from uuid import uuid4
 
 import pytest
+from conftest import FakeApp
+
 from bax_codex_light.bridge import Bridge
 from bax_codex_light.registry import Registry
-from conftest import FakeApp
 
 
 async def test_auto_project_uses_exact_thread_not_process_directory(tmp_path):

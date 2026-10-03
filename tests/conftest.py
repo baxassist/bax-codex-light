@@ -11,9 +11,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from bax_codex_light import __version__
 from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from websockets.asyncio.server import serve
+
+from bax_codex_light import __version__
 
 
 def thread(project, *, state="idle", thread_id="current"):
