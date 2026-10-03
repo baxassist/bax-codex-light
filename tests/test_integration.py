@@ -132,7 +132,7 @@ async def test_official_mcp_stdio_client_and_clean_eof(tmp_path):
         initialize = await session.initialize()
         assert initialize.server_info.name == "bax-codex-light"
         tools = await session.list_tools()
-        assert {tool.name for tool in tools.tools} == {"bax_status", "bax_attach"}
+        assert {tool.name for tool in tools.tools} == {"bax_status", "bax_attach", "bax_pair"}
         response = await session.call_tool("bax_status", {})
         assert not response.is_error
         assert response.structured_content["needs_thread"] is True

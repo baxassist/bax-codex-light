@@ -20,8 +20,10 @@ SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read"]
 
 
 class Bridge:
-    def __init__(self, project: Path, registry: Registry, thread_id: str = "", endpoint: str | None = None):
-        self.project = project.resolve()
+    def __init__(
+        self, project: Path | None, registry: Registry, thread_id: str = "", endpoint: str | None = None
+    ):
+        self.project = project.resolve() if project else None
         self.registry = registry
         self.thread_id = thread_id
         self.endpoint = endpoint
@@ -40,7 +42,7 @@ class Bridge:
 
     def status(self) -> dict:
         return {
-            "project": str(self.project),
+            "project": str(self.project) if self.project else None,
             "thread_id": self.thread_id or None,
             "state": self.state,
             "connected": bool(self.relay and self.relay.connected),
@@ -48,9 +50,18 @@ class Bridge:
             "pending_questions": len(self.questions),
             "error": self.error or (self.relay.error if self.relay else ""),
             "needs_thread": not bool(self.thread_id),
+            "needs_pairing": bool(self.project and not self.registry.get(self.project)),
         }
 
     async def start(self) -> None:
+        if self.thread_id and self.project is None:
+            probe = AppServer(self.endpoint)
+            try:
+                await probe.open()
+                thread = await probe.inspect(self.thread_id)
+                self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
+            finally:
+                await probe.close()
         if self.thread_id and self.task is None:
             self.task = asyncio.create_task(self._run(), name="bax-bridge")
 
@@ -65,10 +76,26 @@ class Bridge:
             probe = AppServer(self.endpoint)
             try:
                 await probe.open()
-                await probe.inspect(thread_id, self.project)
+                thread = await probe.inspect(thread_id, self.project)
             finally:
                 await probe.close()
             self.thread_id = thread_id
+            self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
+            await self.start()
+            return self.status()
+
+    async def pair(self, code: str, api: str) -> dict:
+        from .pairing import redeem
+
+        async with self.lock:
+            if not self.thread_id or self.project is None:
+                raise ValueError("Сначала вызовите bax_attach с точным CODEX_THREAD_ID этого разговора")
+            if self.registry.get(self.project):
+                raise ValueError("Этот проект уже подключён. Существующая регистрация сохранена")
+            registration = await redeem(code, api)
+            self.registry.put(self.project, registration)
+            if self.task is not None and self.task.done():
+                self.task = None
             await self.start()
             return self.status()
 
@@ -79,7 +106,7 @@ class Bridge:
             try:
                 registration = self.registry.get(self.project)
                 if not registration:
-                    self.error = "Нет регистрации. Выполните bax-codex-light connect для этого проекта"
+                    self.error = "Нет регистрации. Получите код подключения в Баксе и вызовите bax_pair"
                     return
                 self.app = AppServer(self.endpoint)
                 await self.app.open(self.on_event)

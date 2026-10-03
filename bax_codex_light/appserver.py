@@ -14,6 +14,8 @@ from openai_codex.generated import v2_all as schemas
 from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from websockets.asyncio.client import connect, unix_connect
 
+from . import __version__
+
 EventHandler = Callable[[dict], Awaitable[None]]
 
 
@@ -59,7 +61,11 @@ class AppServer:
             self.info = await self.request(
                 "initialize",
                 {
-                    "clientInfo": {"name": "bax_codex_light", "title": "Bax Codex Light", "version": "0.1.0"},
+                    "clientInfo": {
+                        "name": "bax_codex_light",
+                        "title": "Bax Codex Light",
+                        "version": __version__,
+                    },
                     "capabilities": {"experimentalApi": True},
                 },
             )
@@ -135,17 +141,16 @@ class AppServer:
             mode="json", by_alias=True, exclude_none=True, exclude_unset=True
         )
 
-    async def inspect(self, thread_id: str, project: Path) -> dict:
+    async def inspect(self, thread_id: str, project: Path | None = None) -> dict:
         params = schemas.ThreadReadParams.model_validate({"threadId": thread_id, "includeTurns": False})
         raw = await self.request("thread/read", params.model_dump(by_alias=True, exclude_unset=True))
         result = schemas.ThreadReadResponse.model_validate(raw).model_dump(
             mode="json", by_alias=True, exclude_none=True, exclude_unset=True
         )
         thread = result["thread"]
-        thread_project, expected_project = await asyncio.gather(
-            asyncio.to_thread(Path(thread["cwd"]).resolve), asyncio.to_thread(project.resolve)
-        )
-        if thread["id"] != thread_id or thread_project != expected_project:
+        thread_project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
+        expected_project = await asyncio.to_thread(project.resolve) if project else thread_project
+        if thread["id"] != thread_id or thread_project != expected_project or not thread_project.is_dir():
             raise RPCError("ID сессии или её рабочий каталог не совпадает с выбранным проектом")
         if thread["status"]["type"] in {"notLoaded", "systemError"}:
             raise RPCError("Сессия не открыта в Codex. Мост не запускает закрытые сессии")
