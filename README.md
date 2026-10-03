@@ -4,16 +4,16 @@
 а история, ответы и вопросы о разрешениях возвращаются на телефон. Своих сессий агент
 не создаёт, модель и разрешения не меняет. Сначала проверяем Mac; Windows пока не поддержан.
 
-## Подключить на этом Mac
+## Подключить на Mac
 
 Нужны Codex с поддержкой плагинов и локального shared app-server, Python **3.11 или новее**
 и агент **Codex Light** в приложении Бакс. Проверено на Codex CLI 0.160.0, Python 3.14.2.
-Публичный GitHub-каталог ещё не опубликован. Для проверки используйте местный каталог:
+Каталог плагина — [baxassist/bax-codex-light](https://github.com/baxassist/bax-codex-light).
 
 1. Один раз выполните в Терминале:
 
    ```bash
-   codex plugin marketplace add /Users/max/projects/bax/bax-codex-light-agent
+   codex plugin marketplace add baxassist/bax-codex-light
    codex plugin add bax-codex@baxassist
    ```
 
@@ -132,6 +132,16 @@ BAX_TEST_PLUGIN_RUNTIME=/private/tmp/bax-codex-plugin-runtime .venv/bin/pytest t
 ```bash
 uv export --locked --no-dev --no-emit-project --no-header --no-annotate -o plugins/bax-codex/requirements.txt
 ```
+
+Для проверки локальной версии добавьте этот каталог вместо GitHub:
+
+```bash
+codex plugin marketplace add /absolute/path/to/bax-codex-light-agent
+codex plugin add bax-codex@baxassist
+```
+
+После каждой завершённой задачи изменения отправляются в `origin/main`:
+`git@github.com:baxassist/bax-codex-light.git`.
 
 API app-server experimental; типы SDK и новые версии Codex нужно проверять совместно.
 Полный прогон с физическим телефоном и действующей моделью пока не выполнен.
