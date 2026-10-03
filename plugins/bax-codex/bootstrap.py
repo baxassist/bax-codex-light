@@ -46,6 +46,7 @@ def ensure_python() -> None:
 
 
 def runtime_python() -> Path:
+    started = time.monotonic()
     requirements = ROOT / "requirements.txt"
     digest = hashlib.sha256(requirements.read_bytes()).hexdigest()[:16]
     data = Path(os.environ.get("BAX_CODEX_PLUGIN_DATA", str(Path.home() / ".bax/codex-runtime")))
@@ -70,6 +71,9 @@ def runtime_python() -> Path:
         if runtime.is_symlink():
             raise RuntimeError("Окружение Бакса не должно быть symlink")
         if ready.is_file() and python.is_file():
+            print(
+                f"Бакс: готовое окружение ({time.monotonic() - started:.2f} с).", file=sys.stderr, flush=True
+            )
             return python
         print("Бакс: первый запуск, устанавливаю библиотеки плагина…", file=sys.stderr, flush=True)
         runtime.mkdir(mode=0o700, exist_ok=True)
@@ -99,6 +103,9 @@ def runtime_python() -> Path:
         if result.returncode:
             raise RuntimeError("Не удалось установить библиотеки. Проверьте интернет и переподключите MCP")
         ready.write_text(digest + "\n")
+        print(
+            f"Бакс: библиотеки установлены ({time.monotonic() - started:.2f} с).", file=sys.stderr, flush=True
+        )
     return python
 
 
@@ -112,6 +119,7 @@ def main() -> None:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(ROOT)
         env["PYTHONNOUSERSITE"] = "1"
+        print("Бакс: запускаю MCP; подключение к Codex проверяется в фоне.", file=sys.stderr, flush=True)
         os.execve(str(python), [str(python), "-m", "bax_codex_light", *sys.argv[1:]], env)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"Бакс: {error}", file=sys.stderr)

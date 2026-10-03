@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from . import files
 from .appserver import AppServer, RPCError, RPCRejected
-from .connection import Relay
+from .connection import Relay, network_error
 from .history import History, identity, render
 from .registry import Registration, Registry
 
@@ -39,6 +39,8 @@ class Bridge:
         self.history: History | None = None
         self.state = "offline"
         self.error = ""
+        self.error_code = ""
+        self.project_ready = asyncio.Event()
         self.questions: dict[str, dict] = {}
         self.requests: dict[int | str, dict] = {}
         self.queue: deque[tuple[str, str]] = deque(maxlen=10)
@@ -46,10 +48,21 @@ class Bridge:
         self.outbox: dict[str, Submission] = {}
         self.turn_id = ""
         self.streamed: set[str] = set()
+        self.seen_async_questions: set[str] = set()
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
 
     def status(self) -> dict:
+        error = self.error or (self.relay.error if self.relay else "")
+        error_code = self.error_code or (self.relay.error_code if self.relay else "")
+        needs_registration = False
+        try:
+            needs_registration = bool(self.project and not self.registry.get(self.project))
+        except (OSError, ValueError, TypeError):
+            error = (
+                "Не удалось прочитать сохранённую регистрацию Бакса. Проверьте доступ к файлу регистрации."
+            )
+            error_code = "registration_unavailable"
         return {
             "project": str(self.project) if self.project else None,
             "thread_id": self.thread_id or None,
@@ -59,20 +72,16 @@ class Bridge:
             "unconfirmed": len(self.outbox),
             "delivery_errors": sum(bool(item.error) for item in self.outbox.values()),
             "pending_questions": len(self.questions),
-            "error": self.error or (self.relay.error if self.relay else ""),
+            "error": error,
+            "error_code": error_code,
             "needs_thread": not bool(self.thread_id),
-            "needs_registration": bool(self.project and not self.registry.get(self.project)),
+            "needs_registration": needs_registration,
         }
 
     async def start(self) -> None:
-        if self.thread_id and self.project is None:
-            probe = AppServer(self.endpoint)
-            try:
-                await probe.open()
-                thread = await probe.inspect(self.thread_id)
-                self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
-            finally:
-                await probe.close()
+        # MCP и его инструменты запускаются сразу; сокет Codex проверяется в фоне.
+        if self.task is not None and self.task.done():
+            self.task = None
         if self.thread_id and self.task is None:
             self.task = asyncio.create_task(self._run(), name="bax-bridge")
 
@@ -84,21 +93,18 @@ class Bridge:
                 if thread_id != self.thread_id:
                     raise ValueError("Мост уже привязан к другому разговору; перезапустите MCP")
                 return self.status()
-            probe = AppServer(self.endpoint)
-            try:
-                await probe.open()
-                thread = await probe.inspect(thread_id, self.project)
-            finally:
-                await probe.close()
             self.thread_id = thread_id
-            self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
             await self.start()
+            # У attach можно кратко дождаться метаданных, не задерживая запуск MCP.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.project_ready.wait(), 2)
             return self.status()
 
     async def connect(self, key: str, server: str = "wss://relay.baxassist.com/agent") -> dict:
         async with self.lock:
             if not self.thread_id or self.project is None:
-                raise ValueError("Сначала вызовите bax_attach с точным CODEX_THREAD_ID этого разговора")
+                detail = self.error or "Сначала вызовите bax_attach с точным CODEX_THREAD_ID этого разговора"
+                raise ValueError(f"Папка разговора ещё не подтверждена. {detail}")
             registration = Registration.from_key(key, server)
             previous = self.registry.get(self.project)
             if previous and previous.agent != registration.agent:
@@ -124,25 +130,48 @@ class Bridge:
         while True:
             relay_task = None
             try:
+                self.app = AppServer(self.endpoint)
+                await self.app.open(self.on_event)
+                thread = await self.app.inspect(self.thread_id, self.project)
+                self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
                 registration = self.registry.get(self.project)
                 if not registration:
                     self.error = "Нет регистрации. Вставьте команду из Бакса и вызовите bax_connect"
+                    self.error_code = "registration_missing"
                     return
-                self.app = AppServer(self.endpoint)
-                await self.app.open(self.on_event)
                 thread = await self.app.attach(self.thread_id, self.project)
                 self._set_state(thread["status"])
                 self.history = self.history or History(self.app, self.thread_id)
                 self.history.app = self.app
                 self.relay = Relay(registration, self.project, self.thread_id)
                 self.error = ""
+                self.error_code = ""
                 relay_task = asyncio.create_task(self.relay.run(self.on_ready, self.on_frame))
+                self.project_ready.set()
                 await self.app.closed.wait()
                 raise RPCError("Сессия Codex отключилась")
             except Exception as error:
                 self.state = "offline"
-                self.error = str(error)
-                log.warning("Codex: %s", type(error).__name__)
+                if isinstance(error, PermissionError):
+                    self.error_code = "codex_socket_permission_denied"
+                    self.error = (
+                        f"ОС запретила доступ к локальному сокету Codex: {self.app.endpoint}. "
+                        "Запускайте MCP штатно из Codex. "
+                        "Ручному запуску в песочнице нужно разрешение доступа."
+                    )
+                elif isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
+                    self.error_code = "codex_unavailable"
+                    self.error = (
+                        f"Локальный сервер Codex недоступен: {self.app.endpoint}. "
+                        "Откройте Codex или перезапустите его; плагин повторит подключение."
+                    )
+                elif isinstance(error, RPCError):
+                    self.error_code = "codex_rpc"
+                    self.error = str(error)
+                else:
+                    self.error_code, self.error = network_error(error, "локальному серверу Codex")
+                self.project_ready.set()
+                log.warning("%s (код: %s)", self.error, self.error_code)
             finally:
                 self.questions.clear()
                 self.requests.clear()
@@ -154,6 +183,7 @@ class Bridge:
                     await self.relay.close()
                 if self.app:
                     await self.app.close()
+                self.project_ready.set()
             await asyncio.sleep(min(2**attempt, 30))
             attempt = min(attempt + 1, 5)
 
@@ -299,6 +329,13 @@ class Bridge:
         if "id" in event:
             await self.question(event)
             return
+        if method in {"thread/archived", "thread/closed"}:
+            self.state = "offline"
+            self.error = "Этот разговор Codex закрыт. Подключите новый разговор его точным CODEX_THREAD_ID."
+            self.error_code = "codex_thread_closed"
+            if self.task:
+                self.task.cancel()
+            return
         if method == "thread/status/changed":
             self._set_state(params["status"])
             await self.send("status", state=self.state)
@@ -312,11 +349,17 @@ class Bridge:
             await self.send("status", state=self.state)
         elif method == "turn/completed":
             self.turn_id = ""
-            self.questions.clear()
-            self.requests.clear()
+            # Асинхронный вопрос остаётся доступным и после завершения хода.
+            for request_id, request in list(self.requests.items()):
+                if request["method"] != "agentMessage/asyncQuestion":
+                    self.requests.pop(request_id)
+                    for qid in request["question_ids"]:
+                        self.questions.pop(qid, None)
             await self.send("done", id=self.history.high if self.history else 0)
         elif method in {"item/started", "item/completed"} and self.history:
             item = params["item"]
+            if item.get("type") == "agentMessage" and item.get("delivery") == "async":
+                await self.async_questions(item, params["turnId"])
             view = render(item)
             if view and view[1]:
                 item_id = identity(item)
@@ -401,6 +444,41 @@ class Bridge:
             self.questions[qid] = {"request_id": request_id, "field_id": field_id, "card": card}
         await self.show_question()
 
+    async def async_questions(self, item: dict, turn_id: str) -> None:
+        if item["id"] in self.seen_async_questions:
+            return
+        self.seen_async_questions.add(item["id"])
+        questions = [q for q in item.get("questions") or [] if q.get("options")]
+        if not questions:
+            return  # На вопрос без вариантов отвечают обычным текстом в композере.
+        request_id = f"async:{item['id']}"
+        self.requests[request_id] = {
+            "method": "agentMessage/asyncQuestion",
+            "turn_id": turn_id,
+            "answers": {},
+            "question_ids": [],
+            "titles": {},
+        }
+        for index, question in enumerate(questions):
+            qid = str(uuid4())
+            field_id = str(index)
+            self.requests[request_id]["question_ids"].append(qid)
+            self.requests[request_id]["titles"][field_id] = question["title"]
+            self.questions[qid] = {
+                "request_id": request_id,
+                "field_id": field_id,
+                "card": {
+                    "question_id": qid,
+                    "kind": "choice",
+                    "tool": "request_user_input_async",
+                    "text": question["title"],
+                    "options": question["options"],
+                    "input": {},
+                    "rule": "",
+                },
+            }
+        await self.show_question()
+
     async def show_question(self) -> None:
         # Нынешний UI Бакса показывает одну карточку; вопросы передаём по очереди.
         if self.questions:
@@ -416,7 +494,12 @@ class Bridge:
         request = self.requests[request_id]
         if frame.get("remember"):
             raise ValueError("Разрешения выдаются только на одно действие")
-        if request["method"] == "item/tool/requestUserInput":
+        if request["method"] == "agentMessage/asyncQuestion":
+            if len(self.queue) == self.queue.maxlen:
+                raise ValueError("Очередь заполнена; дождитесь выполнения задач")
+            if not self.app or self.app.closed.is_set():
+                raise RPCError("Сессия Codex недоступна; вопрос сохранён для повторной подписки")
+        if request["method"] in {"item/tool/requestUserInput", "agentMessage/asyncQuestion"}:
             option = frame.get("option")
             if frame.get("verdict") != "choice" or not isinstance(option, str) or not option.strip():
                 raise ValueError("Нужен текст ответа на вопрос")
@@ -433,11 +516,39 @@ class Bridge:
             result = {"decision": "accept" if verdict == "allow" else "decline"}
         if not self.app:
             raise RPCError("Codex не подключён")
-        await self.app.respond(request_id, result)
+        if request["method"] == "agentMessage/asyncQuestion":
+            await self.submit_async_answer(request)
+        else:
+            await self.app.respond(request_id, result)
         self.requests.pop(request_id, None)
         for other in request["question_ids"]:
             self.questions.pop(other, None)
         await self.show_question()
+
+    async def submit_async_answer(self, request: dict) -> None:
+        text = "\n\n".join(
+            f"{request['titles'][field_id]}\nОтвет: {answer['answers'][0]}"
+            for field_id, answer in request["answers"].items()
+        )
+        if len(self.queue) == self.queue.maxlen:
+            raise ValueError("Очередь заполнена; дождитесь выполнения задач")
+        client_id = str(uuid4())
+        self.outbox[client_id] = Submission(text)
+        await self.send("message", id=self.history.preview_id(client_id), kind="user", text=text)
+        if self.state in {"busy", "waiting"}:
+            try:
+                # Ответ идёт в тот ход, который задал вопрос. Другой ход не затрагиваем.
+                await self.app.steer_turn(self.thread_id, request["turn_id"], text, client_id)
+                return
+            except RPCRejected:
+                pass  # Ход уже завершился: обычная очередь того же разговора.
+            except Exception:
+                message = "Доставка ответа не подтверждена. Проверьте разговор перед повторной отправкой."
+                self.outbox[client_id].error = message
+                await self.send("error", code="delivery_uncertain", message=message)
+                return
+        self.queue.append((client_id, text))
+        await self._drain()
 
     async def close(self) -> None:
         if self.task:

@@ -38,6 +38,7 @@ class FakeApp:
 class FakeRelay:
     connected = True
     error = ""
+    error_code = ""
 
     def __init__(self):
         self.sent = []

@@ -83,6 +83,8 @@ class FakeApp:
                     self.state = "active"
                     self.started.set()
                     result = {"turn": {"id": "turn", "items": [], "status": "inProgress"}}
+                elif method == "turn/steer":
+                    result = {"turnId": message["params"]["expectedTurnId"]}
                 elif method == "test/error":
                     await ws.send(json.dumps({"id": message["id"], "error": {"code": -1, "message": "test"}}))
                     continue
@@ -115,8 +117,8 @@ async def until(predicate, timeout=3):
 
 @pytest.fixture
 def installed_plugin(tmp_path):
-    if sys.platform != "darwin" or not shutil.which("codex"):
-        pytest.skip("Нужен Mac с Codex CLI")
+    if sys.platform not in {"darwin", "linux"} or not shutil.which("codex"):
+        pytest.skip("Нужен Mac или Linux с Codex CLI")
     market = tmp_path / "Каталог с пробелами"
     shutil.copytree(
         Path(__file__).resolve().parents[1] / "plugins",

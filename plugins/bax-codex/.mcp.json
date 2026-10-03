@@ -5,7 +5,8 @@
       "args": ["./bootstrap.py", "serve", "--auto-project"],
       "cwd": ".",
       "env_vars": ["PATH", "CODEX_HOME", "CODEX_THREAD_ID"],
-      "startup_timeout_sec": 240
+      "startup_timeout_sec": 240,
+      "required": true
     }
   }
 }

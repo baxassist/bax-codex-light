@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,8 @@ class RPCRejected(RPCError):
 
 class AppServer:
     def __init__(self, endpoint: str | None = None, *, timeout: float = 20):
-        self.endpoint = endpoint or str(Path.home() / ".codex/app-server-control/app-server-control.sock")
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        self.endpoint = endpoint or str(codex_home / "app-server-control/app-server-control.sock")
         self.timeout = timeout
         self.ws: Any = None
         self.pending: dict[int, asyncio.Future] = {}
@@ -197,6 +199,19 @@ class AppServer:
             schemas.TurnStartResponse,
             {
                 "threadId": thread_id,
+                "clientUserMessageId": client_id,
+                "input": [{"type": "text", "text": text}],
+            },
+        )
+
+    async def steer_turn(self, thread_id: str, turn_id: str, text: str, client_id: str) -> dict:
+        return await self.typed(
+            "turn/steer",
+            schemas.TurnSteerParams,
+            schemas.TurnSteerResponse,
+            {
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
                 "clientUserMessageId": client_id,
                 "input": [{"type": "text", "text": text}],
             },

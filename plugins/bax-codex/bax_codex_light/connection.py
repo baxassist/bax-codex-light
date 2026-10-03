@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import socket
+import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from . import __version__
 from .protocol import backoff, frame, parse, sign
@@ -18,8 +21,40 @@ from .registry import Registration
 log = logging.getLogger(__name__)
 
 
-class FatalRelayError(RuntimeError):
-    pass
+class RelayResponseError(RuntimeError):
+    def __init__(self, message: str, code: str = "relay_protocol"):
+        super().__init__(message)
+        self.code = code
+
+
+class FatalRelayError(RelayResponseError):
+    """Отказ релея, при котором повтор с тем же ключом не поможет."""
+
+
+def network_error(error: Exception, service: str) -> tuple[str, str]:
+    if isinstance(error, PermissionError):
+        return "permission_denied", f"ОС запретила подключение к {service}. Проверьте разрешения запуска MCP."
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return (
+            "tls_certificate",
+            f"Ошибка проверки TLS при подключении к {service}. Проверьте дату и сертификаты Python.",
+        )
+    if isinstance(error, TimeoutError):
+        return "timeout", f"Подключение к {service} превысило время ожидания. Проверьте соединение."
+    if isinstance(error, InvalidStatus):
+        code = error.response.status_code
+        return "http_rejected", f"WebSocket-подключение к {service} отклонено (HTTP {code})."
+    if isinstance(error, ConnectionClosed):
+        return "connection_closed", f"Соединение с сервером закрыто: {service}. Подключение будет повторено."
+    if isinstance(error, OSError):
+        return (
+            "network_unavailable",
+            f"Нет подключения к {service} ({type(error).__name__}). Проверьте сеть и адрес сервера.",
+        )
+    return (
+        "connection_failed",
+        f"Сбой подключения к {service} ({type(error).__name__}). Подключение будет повторено.",
+    )
 
 
 class Relay:
@@ -30,6 +65,7 @@ class Relay:
         self.ws: Any = None
         self.connected = False
         self.error = ""
+        self.error_code = ""
 
     async def send(self, frame_type: str, **fields: Any) -> bool:
         if not self.connected or self.ws is None:
@@ -46,9 +82,23 @@ class Relay:
             raise FatalRelayError("Несовместимая версия протокола Бакса")
         if data.get("type") == "error":
             code = data.get("code", "unknown")
+            if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", code):
+                code = "unknown"
+            message = data.get("message")
+            if not isinstance(message, str) or not message.strip():
+                message = {
+                    "agent_busy": "Бакс уже подключён к другому разговору этого проекта. Закройте его мост.",
+                    "unauthorized": "Регистрация отклонена. Скопируйте актуальную команду из Бакса.",
+                    "key_claimed": "Ключ закреплён за другим компьютером. Выпустите отдельный ключ в Баксе.",
+                    "wrong_engine": "Этот агент создан для другого движка.",
+                    "unsupported_version": "Версии протокола несовместимы. Обновите плагин.",
+                    "agent_taken": "Подключение занято другим разговором.",
+                }.get(code, "Релей отклонил запрос")
+            message = " ".join(message.replace(self.registration.secret, "[секрет скрыт]").split())[:1000]
+            detail = f"{message} (код: {code})"
             if code in {"unauthorized", "key_claimed", "wrong_engine", "unsupported_version", "agent_taken"}:
-                raise FatalRelayError(f"Бакс: {code}")
-            raise RuntimeError(f"Бакс: {code}")
+                raise FatalRelayError(detail, code)
+            raise RelayResponseError(detail, code)
         return data
 
     async def session(
@@ -83,6 +133,7 @@ class Relay:
                     raise FatalRelayError("Сервер вернул другого агента")
                 self.connected = True
                 self.error = ""
+                self.error_code = ""
                 await on_ready()
                 while True:
                     message = await self._receive()
@@ -103,11 +154,16 @@ class Relay:
                 await self.session(on_ready, on_frame)
             except FatalRelayError as error:
                 self.error = str(error)
+                self.error_code = error.code
                 log.error("%s", self.error)
                 return
+            except RelayResponseError as error:
+                self.error = str(error)
+                self.error_code = error.code
+                log.warning("%s; переподключение", self.error)
             except Exception as error:
-                self.error = type(error).__name__
-                log.warning("Бакс: связь прервана (%s); переподключение", self.error)
+                self.error_code, self.error = network_error(error, "релею Бакса")
+                log.warning("%s", self.error)
             await asyncio.sleep(backoff(attempt))
             attempt += 1
 
