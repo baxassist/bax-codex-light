@@ -112,7 +112,7 @@ async def test_relay_rejects_identity_mismatch(tmp_path):
         assert not relay.connected
 
 
-async def test_busy_question_survives_history_and_relay_reconnect_then_runs_once(tmp_path):
+async def test_busy_comment_is_steered_immediately_and_history_reconnect_does_not_resend(tmp_path):
     fake = FakeApp(tmp_path)
     fake.state = "active"
     mobile = []
@@ -143,6 +143,7 @@ async def test_busy_question_survives_history_and_relay_reconnect_then_runs_once
             await until(lambda: any(frame.get("type") == "background" for frame in mobile))
             await sockets[-1].send(json.dumps({"v": 1, "type": "run", "text": question}))
             await until(lambda: len(questions()) == 1)
+            await until(lambda: any(call["method"] == "turn/steer" for call in fake.calls))
             preview_id = questions()[0]["id"]
             await sockets[-1].send(json.dumps({"v": 1, "type": "subscribe"}))
             await until(lambda: len(questions()) == 2)
@@ -151,14 +152,13 @@ async def test_busy_question_survives_history_and_relay_reconnect_then_runs_once
             await sockets[-1].close()
             await until(lambda: len(sockets) == 2 and len(questions()) == 3)
             assert {frame["id"] for frame in questions()} == {preview_id}
-            assert b.status()["queued"] == 1
-
-            fake.state = "idle"
-            await fake.emit("thread/status/changed", {"threadId": "current", "status": {"type": "idle"}})
-            await asyncio.wait_for(fake.started.wait(), 2)
-            starts = [call for call in fake.calls if call["method"] == "turn/start"]
-            assert len(starts) == 1
-            client_id = starts[0]["params"]["clientUserMessageId"]
+            assert b.status()["queued"] == 0
+            steers = [call for call in fake.calls if call["method"] == "turn/steer"]
+            assert len(steers) == 1
+            assert steers[0]["params"]["threadId"] == "current"
+            assert steers[0]["params"]["expectedTurnId"] == "turn"
+            assert not any(call["method"] in {"turn/start", "thread/start"} for call in fake.calls)
+            client_id = steers[0]["params"]["clientUserMessageId"]
             native = entry("native-question", "userMessage", question)
             native["item"]["clientId"] = client_id
             fake.items.insert(0, native)
@@ -178,7 +178,27 @@ async def test_busy_question_survives_history_and_relay_reconnect_then_runs_once
                 if frame.get("kind") == "user" and frame.get("text") == question
             ]
             assert len(restored) == 1
-            assert len([call for call in fake.calls if call["method"] == "turn/start"]) == 1
+            assert not any(call["method"] == "turn/start" for call in fake.calls)
+            assert len([call for call in fake.calls if call["method"] == "turn/steer"]) == 1
+
+            answer = entry("comment-answer", text="Актуальное уточнение учтено")
+            fake.items.insert(0, answer)
+            await fake.emit(
+                "item/completed",
+                {
+                    "threadId": "current",
+                    "turnId": "turn",
+                    "completedAtMs": 3,
+                    "item": answer["item"],
+                },
+            )
+            await until(lambda: any(frame.get("text") == "Актуальное уточнение учтено" for frame in mobile))
+            marker = len(mobile)
+            await sockets[-1].send(json.dumps({"v": 1, "type": "subscribe"}))
+            await until(lambda: any(frame.get("type") == "background" for frame in mobile[marker:]))
+            rows = [frame for frame in mobile[marker:] if frame.get("type") == "message"]
+            assert rows[-1]["text"] == "Актуальное уточнение учтено"
+            assert rows[-2]["text"] == question
         finally:
             await b.close()
 

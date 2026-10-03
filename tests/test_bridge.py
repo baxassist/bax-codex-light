@@ -14,6 +14,8 @@ class FakeApp:
     def __init__(self):
         self.closed = asyncio.Event()
         self.state = "active"
+        self.active_turn_id = ""
+        self.steers = []
         self.calls = []
         self.responses = []
         self.fail = False
@@ -29,6 +31,13 @@ class FakeApp:
         if self.fail:
             raise TimeoutError
         return {"turn": {"id": "turn"}}
+
+    async def active_turn(self, thread_id):
+        return self.active_turn_id if self.state == "active" else ""
+
+    async def steer_turn(self, thread_id, turn_id, text, client_id):
+        self.steers.append((thread_id, turn_id, text, client_id))
+        return {"turnId": turn_id}
 
     async def respond(self, request_id, result):
         self.responses.append((request_id, result))
@@ -66,7 +75,7 @@ def bridge(tmp_path):
     return result
 
 
-async def test_busy_tasks_queue_without_steering_and_only_one_starts(tmp_path):
+async def test_missing_active_turn_id_queues_then_delivers_backlog_in_one_turn(tmp_path):
     b = bridge(tmp_path)
     await b.on_frame({"type": "run", "text": "первое"})
     await b.on_frame({"type": "run", "text": "второе"})
@@ -75,18 +84,8 @@ async def test_busy_tasks_queue_without_steering_and_only_one_starts(tmp_path):
     b.app.state = "idle"
     await asyncio.gather(b._drain(), b._drain())
     assert b.app.calls == [("current", "первое")]
-    assert [text for _client_id, text in b.queue] == ["второе"]
-    b.app.state = "idle"
-    await b.on_event(
-        {
-            "method": "thread/status/changed",
-            "params": {
-                "threadId": "current",
-                "status": {"type": "idle"},
-            },
-        }
-    )
-    assert b.app.calls[-1] == ("current", "второе")
+    assert b.app.steers[0][:3] == ("current", "turn", "второе")
+    assert not b.queue
 
 
 async def test_queued_question_survives_reopening_phone_history(tmp_path):

@@ -26,6 +26,8 @@ SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read",
 class Submission:
     text: str
     error: str = ""
+    # Поздний ответ на async-вопрос не вмешивается в другой уже активный ход.
+    steer_allowed: bool = True
 
 
 class Bridge:
@@ -354,22 +356,64 @@ class Bridge:
 
     async def _drain(self) -> None:
         async with self.lock:
+            rejected_steers = set()
             while self.queue and self.app:
                 thread = await self.app.inspect(self.thread_id, self.project)
                 self._set_state(thread["status"])
-                if self.state != "ready":
+                index = 0
+                target_turn = ""
+                if self.state in {"busy", "waiting"}:
+                    index = next(
+                        (i for i, (cid, _) in enumerate(self.queue) if self.outbox[cid].steer_allowed), None
+                    )
+                    if index is not None:
+                        target_turn = self.turn_id or await self.app.active_turn(self.thread_id)
+                    if index is None or not target_turn:
+                        await self.send("status", state=self.state)
+                        return
+                elif self.state != "ready":
                     await self.send("status", state=self.state)
                     return
                 # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
-                client_id, text = self.queue.popleft()
-                self.state = "busy"
+                client_id, text = self.queue[index]
+                del self.queue[index]
+                if not target_turn:
+                    self.state = "busy"
                 await self.send("status", state=self.state)
                 try:
-                    result = await self.app.start_turn(self.thread_id, text, client_id)
-                    self.turn_id = result["turn"]["id"]
-                    log.info("Codex: сообщение %s принято, ход %s", client_id, self.turn_id)
-                    return
+                    if target_turn:
+                        await self.app.steer_turn(self.thread_id, target_turn, text, client_id)
+                    else:
+                        result = await self.app.start_turn(self.thread_id, text, client_id)
+                        self.turn_id = result["turn"]["id"]
+                    log.info("Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id)
                 except Exception as error:
+                    if target_turn and isinstance(error, RPCRejected):
+                        # Явный отказ означает, что сообщение не принято. Ход мог
+                        # закончиться между проверкой и steer: сверяем ID ещё один раз.
+                        self.turn_id = ""
+                        if len(self.queue) == self.queue.maxlen:
+                            message = (
+                                "Codex не принял комментарий, а очередь уже заполнена. "
+                                "Текст сохранён в ленте; повторите отправку после доставки "
+                                "ожидающих сообщений."
+                            )
+                            self.outbox[client_id].error = message
+                            await self.send("error", code="delivery_rejected", message=message)
+                            return
+                        self.queue.insert(index, (client_id, text))
+                        if client_id not in rejected_steers:
+                            rejected_steers.add(client_id)
+                            continue
+                        await self.send(
+                            "error",
+                            code="message_queued",
+                            message=(
+                                "Codex пока не принял комментарий. Сообщение сохранено в очереди "
+                                "и будет доставлено, когда ход станет доступен."
+                            ),
+                        )
+                        return
                     # Повтор требует решения человека; предварительное эхо остаётся
                     # видимым до подтверждения настоящей историей Codex.
                     message = (
@@ -411,12 +455,13 @@ class Bridge:
             await self.send("status", state=self.state)
             if self.state == "offline" and self.app:
                 await self.app.close()
-            elif self.state == "ready":
+            elif self.state in {"ready", "busy", "waiting"}:
                 await self._drain()
         elif method == "turn/started":
             self.turn_id = params["turn"]["id"]
             self.state = "busy"
             await self.send("status", state=self.state)
+            await self._drain()
         elif method == "turn/completed":
             self.turn_id = ""
             # Асинхронный вопрос остаётся доступным и после завершения хода.
@@ -683,7 +728,7 @@ class Bridge:
         if len(self.queue) == self.queue.maxlen:
             raise ValueError("Очередь заполнена; дождитесь выполнения задач")
         client_id = str(uuid4())
-        self.outbox[client_id] = Submission(text)
+        self.outbox[client_id] = Submission(text, steer_allowed=False)
         await self.send("message", id=self.history.preview_id(client_id), kind="user", text=text)
         if self.state in {"busy", "waiting"}:
             try:

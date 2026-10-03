@@ -198,6 +198,16 @@ class AppServer:
             },
         )
 
+    async def active_turn(self, thread_id: str) -> str:
+        result = await self.typed(
+            "thread/turns/list",
+            schemas.ThreadTurnsListParams,
+            schemas.ThreadTurnsListResponse,
+            {"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"},
+        )
+        turn = next(iter(result["data"]), None)
+        return turn["id"] if turn and turn["status"] == "inProgress" else ""
+
     async def start_turn(self, thread_id: str, text: str, client_id: str) -> dict:
         return await self.typed(
             "turn/start",

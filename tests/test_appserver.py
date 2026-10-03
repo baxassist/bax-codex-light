@@ -72,3 +72,29 @@ async def test_notification_overflow_closes_instead_of_blocking(tmp_path):
         await fake.emit("unknown", {})
         await asyncio.wait_for(app.closed.wait(), 2)
         await app.close()
+
+
+async def test_active_turn_lookup_reads_only_latest_turn_metadata(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.state = "active"
+    fake.active_turn_id = "active-turn"
+    async with fake.running() as endpoint:
+        app = AppServer(endpoint)
+        try:
+            await app.open()
+            assert await app.active_turn("current") == "active-turn"
+            call = next(c for c in fake.calls if c["method"] == "thread/turns/list")
+            assert call["params"] == {
+                "threadId": "current",
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "notLoaded",
+            }
+            fake.state = "idle"
+            assert await app.active_turn("current") == ""
+            assert not any(
+                c["method"] in {"thread/resume", "thread/start", "turn/start", "turn/steer"}
+                for c in fake.calls
+            )
+        finally:
+            await app.close()

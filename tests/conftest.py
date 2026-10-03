@@ -45,6 +45,7 @@ class FakeApp:
     def __init__(self, project):
         self.project = project
         self.state = "idle"
+        self.active_turn_id = "turn"
         self.calls = []
         self.responses = []
         self.connections = set()
@@ -80,6 +81,12 @@ class FakeApp:
                     }
                 elif method == "thread/items/list":
                     result = {"data": self.items, "nextCursor": None, "backwardsCursor": None}
+                elif method == "thread/turns/list":
+                    result = {
+                        "data": [{"id": self.active_turn_id, "status": "inProgress", "items": []}]
+                        if self.state == "active" and self.active_turn_id
+                        else [],
+                    }
                 elif method == "turn/start":
                     self.state = "active"
                     self.started.set()
