@@ -97,7 +97,12 @@ class ProjectController:
         for thread_id, bridge in self.sessions.items():
             sessions[thread_id] = {
                 "pending": {
-                    cid: {"text": item.text, "error": item.error, "steer_allowed": item.steer_allowed}
+                    cid: {
+                        "text": item.text,
+                        "error": item.error,
+                        "steer_allowed": item.steer_allowed,
+                        "image_count": item.image_count,
+                    }
                     for cid, item in bridge.outbox.items()
                 }
             }
@@ -243,6 +248,7 @@ class ProjectController:
                     error=pending.get("error")
                     or "Контроллер перезапущен. Проверьте историю перед повторной отправкой.",
                     steer_allowed=pending.get("steer_allowed", True),
+                    image_count=pending.get("image_count", 0),
                 )
             self.sessions[thread_id] = bridge
         bridge = self.sessions[thread_id]

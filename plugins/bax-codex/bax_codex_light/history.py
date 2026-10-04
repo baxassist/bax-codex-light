@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .images import preview
+
 
 def identity(item: dict) -> str:
     return item.get("clientId") or item["id"]
@@ -12,9 +14,9 @@ def identity(item: dict) -> str:
 def render(item: dict) -> tuple[str, str] | None:
     kind = item.get("type")
     if kind == "userMessage":
-        return "user", "\n".join(
-            part.get("text", "") for part in item.get("content", []) if part.get("type") == "text"
-        )
+        content = item.get("content", [])
+        text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
+        return "user", preview(text, sum(p.get("type") in {"image", "localImage"} for p in content))
     if kind == "agentMessage":
         text = item.get("text", "")
         # В async-сообщении сам вопрос может быть только в questions, без text.

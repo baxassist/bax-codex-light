@@ -173,10 +173,27 @@ class ProjectClient:
             raise ValueError("Нужен точный CODEX_THREAD_ID текущего разговора")
         directory = runtime_path(self.project, self.registry, self.endpoint)
         try:
-            await request(directory, "status")
-            return directory
+            status = await request(directory, "status")
         except (OSError, TimeoutError):
-            pass
+            status = None
+        if status is not None:
+            version = status.get("plugin_version", "")
+            try:
+                previous = tuple(int(part) for part in version.split("."))
+                installed = tuple(int(part) for part in __version__.split("."))
+            except ValueError as error:
+                raise RPCError("Неизвестная версия контроллера; работающий проект сохранён") from error
+            if previous >= installed:
+                return directory  # Старое окно MCP не понижает уже обновлённый контроллер.
+            # Владелец сам проверяет фоновые ходы, доставки и вопросы перед остановкой.
+            # Если он занят, auto_discover повторит попытку; связь остаётся у прежнего владельца.
+            await request(directory, "shutdown")
+            for _ in range(100):
+                if not (directory / "control.sock").exists():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise RPCError("Старый контроллер ещё завершает работу; обновление будет повторено")
         private_directory(directory)
         env = {k: v for k, v in os.environ.items() if k not in {"CODEX_THREAD_ID", "BAX_CODEX_THREAD_ID"}}
         source_path = await asyncio.to_thread(Path(__file__).resolve)

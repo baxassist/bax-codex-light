@@ -332,7 +332,9 @@ class AppServer:
         turn = next(iter(result["data"]), None)
         return turn["id"] if turn and turn["status"] == "inProgress" else ""
 
-    async def start_turn(self, thread_id: str, text: str, client_id: str) -> dict:
+    async def start_turn(
+        self, thread_id: str, text: str, client_id: str, *, images: list[dict] | None = None
+    ) -> dict:
         return await self.typed(
             "turn/start",
             schemas.TurnStartParams,
@@ -340,11 +342,13 @@ class AppServer:
             {
                 "threadId": thread_id,
                 "clientUserMessageId": client_id,
-                "input": [{"type": "text", "text": text}],
+                "input": ([{"type": "text", "text": text}] if text else []) + (images or []),
             },
         )
 
-    async def steer_turn(self, thread_id: str, turn_id: str, text: str, client_id: str) -> dict:
+    async def steer_turn(
+        self, thread_id: str, turn_id: str, text: str, client_id: str, *, images: list[dict] | None = None
+    ) -> dict:
         return await self.typed(
             "turn/steer",
             schemas.TurnSteerParams,
@@ -353,7 +357,7 @@ class AppServer:
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
                 "clientUserMessageId": client_id,
-                "input": [{"type": "text", "text": text}],
+                "input": ([{"type": "text", "text": text}] if text else []) + (images or []),
             },
         )
 

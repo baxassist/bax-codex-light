@@ -34,7 +34,11 @@
 Общие ошибки Lite формируются из фактического движка.
 Прежний mode=lite не заявляет sessions/cancel. С 0.4.0 mode=project объявляет
 `sessions.list`, `session.select`, `session.close`, `cancel`; требуется Бакс 0.75.5+.
-Model/effort, compact, attachments и отдельные background tasks не заявлены.
+Model/effort, compact и отдельные background tasks не заявлены. С 0.4.1 `run.attachments`
+принимает JPEG/PNG/WebP/GIF в base64: до 8 картинок, 6 МиБ каждая, 8 МиБ вместе.
+App-server получает штатные `image` inputs с data URL и точным thread/turn ID.
+В состоянии проекта сохраняются только текст и число картинок неподтверждённой задачи;
+автоматического повтора после аварии нет. Вложения остаются в истории Codex.
 
 ## Контроллер проекта (0.4.0)
 

@@ -124,7 +124,7 @@ class Relay:
     ) -> None:
         reg = self.registration
         async with connect(
-            reg.server, max_size=4 * 1024 * 1024, open_timeout=20, ping_interval=20, ping_timeout=20
+            reg.server, max_size=16 * 1024 * 1024, open_timeout=20, ping_interval=20, ping_timeout=20
         ) as ws:
             self.ws = ws
             try:

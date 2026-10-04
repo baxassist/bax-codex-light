@@ -115,7 +115,7 @@ class FakeApp:
 
     @asynccontextmanager
     async def running(self):
-        async with serve(self.handle, "127.0.0.1", 0) as server:
+        async with serve(self.handle, "127.0.0.1", 0, max_size=16 * 1024 * 1024) as server:
             yield f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
 
 

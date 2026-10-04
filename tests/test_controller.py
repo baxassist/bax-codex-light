@@ -4,6 +4,7 @@ import pytest
 from conftest import until
 from test_project import ProjectApp
 
+from bax_codex_light.appserver import RPCError
 from bax_codex_light.controller import ProjectClient, private_directory, request, runtime_path
 from bax_codex_light.registry import Registry
 
@@ -45,3 +46,43 @@ def test_controller_rejects_public_directory_and_symlink(tmp_path):
     link.symlink_to(public, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         private_directory(link)
+
+
+@pytest.mark.parametrize("busy", [False, True])
+async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_path, monkeypatch, busy):
+    import bax_codex_light.controller as controller
+
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        client = ProjectClient(tmp_path, registry, "a", endpoint)
+        directory = await client.ensure_controller()
+        old_pid = (await request(directory, "status"))["controller_pid"]
+        if busy:
+            fake.threads["a"]["status"] = {"type": "active", "activeFlags": []}
+        await client.bind("a")
+        original_request = controller.request
+
+        async def older(directory, method, **params):
+            result = await original_request(directory, method, **params)
+            if method == "status" and result["controller_pid"] == old_pid:
+                result["plugin_version"] = "0.4.0"
+            return result
+
+        monkeypatch.setattr(controller, "request", older)
+        try:
+            if busy:
+                with pytest.raises(RPCError, match="занят"):
+                    await client.ensure_controller()
+                assert (await original_request(directory, "status"))["controller_pid"] == old_pid
+                await fake.emit("thread/status/changed", {"threadId": "a", "status": {"type": "idle"}})
+                await asyncio.sleep(0.1)
+            else:
+                await client.ensure_controller()
+                current = await original_request(directory, "status")
+                assert current["controller_pid"] != old_pid
+                assert current["thread_id"] == "a"
+        finally:
+            await client.close()
+            await original_request(directory, "shutdown")
+            await until(lambda: not fake.connections)

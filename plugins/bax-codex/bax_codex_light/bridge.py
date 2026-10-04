@@ -6,11 +6,11 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from . import __version__, files
+from . import __version__, files, images
 from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
@@ -28,6 +28,12 @@ class Submission:
     error: str = ""
     # Поздний ответ на async-вопрос не вмешивается в другой уже активный ход.
     steer_allowed: bool = True
+    images: list[dict] = field(default_factory=list)
+    image_count: int = 0
+
+    @property
+    def preview(self) -> str:
+        return images.preview(self.text, self.image_count)
 
 
 class Bridge:
@@ -57,6 +63,7 @@ class Bridge:
         self.seen_async_questions: set[str] = set()
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
+        self.input_lock = asyncio.Lock()
 
     def status(self) -> dict:
         error = self.error or (self.relay.error if self.relay else "")
@@ -290,7 +297,7 @@ class Bridge:
                     {
                         "id": self.history.preview_id(client_id),
                         "kind": "user",
-                        "text": submission.text,
+                        "text": submission.preview,
                     }
                 )
                 if submission.error:
@@ -318,20 +325,7 @@ class Bridge:
                     int(frame.get("before", 0)), max(1, min(int(frame.get("limit", 50)), 100))
                 )
             elif kind == "run":
-                if frame.get("attachments"):
-                    raise ValueError("В этой версии принимаются только текстовые задачи")
-                text = frame.get("text")
-                if not isinstance(text, str) or not text.strip() or len(text) > 100_000:
-                    raise ValueError("Нужна непустая текстовая задача до 100000 символов")
-                if len(self.queue) == self.queue.maxlen:
-                    raise ValueError("Очередь заполнена; дождитесь выполнения задач")
-                if not self.history or not self.app or self.app.closed.is_set():
-                    raise RPCError("Сессия Codex недоступна")
-                client_id = str(uuid4())
-                self.queue.append((client_id, text))
-                self.outbox[client_id] = Submission(text)
-                # Эхо подтверждает приём в очередь для таймера доставки на телефоне.
-                await self.send("message", id=self.history.preview_id(client_id), kind="user", text=text)
+                await self.accept_run(frame)
                 await self._drain()
             elif kind == "answer":
                 await self.answer(frame)
@@ -353,6 +347,28 @@ class Bridge:
                 await self.send("error", code="unsupported", message=f"Команда {kind!r} не поддерживается")
         except (ValueError, RPCError, TimeoutError) as error:
             await self.send("error", code="invalid_request", message=str(error))
+
+    async def accept_run(self, frame: dict) -> None:
+        # Подготовка большой картинки не меняет порядок следующих текстовых комментариев.
+        async with self.input_lock:
+            text = frame.get("text")
+            if not isinstance(text, str) or len(text) > 100_000:
+                raise ValueError("Текст задачи должен быть не длиннее 100000 символов")
+            if len(self.queue) == self.queue.maxlen:
+                raise ValueError("Очередь заполнена; дождитесь выполнения задач")
+            if not self.history or not self.app or self.app.closed.is_set():
+                raise RPCError("Сессия Codex недоступна")
+            raw = frame.get("attachments")
+            picture_inputs = [] if raw is None or raw == [] else await asyncio.to_thread(images.inputs, raw)
+            if not text.strip() and not picture_inputs:
+                raise ValueError("Нужен текст задачи или картинка")
+            client_id = str(uuid4())
+            self.queue.append((client_id, text))
+            submission = Submission(text, images=picture_inputs, image_count=len(picture_inputs))
+            self.outbox[client_id] = submission
+            await self.send(
+                "message", id=self.history.preview_id(client_id), kind="user", text=submission.preview
+            )
 
     async def _drain(self) -> None:
         async with self.lock:
@@ -381,11 +397,15 @@ class Bridge:
                     self.state = "busy"
                 await self.send("status", state=self.state)
                 try:
+                    submission = self.outbox[client_id]
+                    extra = {"images": submission.images} if submission.images else {}
                     if target_turn:
-                        await self.app.steer_turn(self.thread_id, target_turn, text, client_id)
+                        await self.app.steer_turn(self.thread_id, target_turn, text, client_id, **extra)
                     else:
-                        result = await self.app.start_turn(self.thread_id, text, client_id)
+                        result = await self.app.start_turn(self.thread_id, text, client_id, **extra)
                         self.turn_id = result["turn"]["id"]
+                    # После приёма изображение хранит Codex; мост оставляет только метаданные эха.
+                    submission.images = []
                     log.info("Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id)
                 except Exception as error:
                     if target_turn and isinstance(error, RPCRejected):
