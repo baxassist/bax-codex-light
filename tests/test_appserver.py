@@ -1,9 +1,79 @@
 import asyncio
 
 import pytest
-from conftest import FakeApp, until
+from conftest import FakeApp, entry, until
 
 from bax_codex_light.appserver import AppServer, RPCError, RPCRejected
+from bax_codex_light.history import History
+
+
+async def test_legacy_history_falls_back_to_native_turn_pages_in_chronological_order(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.items_error = "thread/items/list is not supported yet"
+    fake.turn_pages = {
+        None: {
+            "data": [
+                {
+                    "id": "newer",
+                    "status": "completed",
+                    "items": [
+                        entry("user-new", "userMessage", "Новая задача")["item"],
+                        entry("answer-new", text="Новый ответ")["item"],
+                    ],
+                }
+            ],
+            "nextCursor": "older",
+        },
+        "older": {
+            "data": [
+                {
+                    "id": "older",
+                    "status": "completed",
+                    "items": [
+                        entry("user-old", "userMessage", "Прежняя задача")["item"],
+                        entry("answer-old", text="Прежний ответ")["item"],
+                    ],
+                }
+            ],
+            "nextCursor": None,
+        },
+    }
+    async with fake.running() as endpoint:
+        app = AppServer(endpoint)
+        await app.open()
+        try:
+            history = History(app, "current")
+            rows = await history.page()
+            assert [row["text"] for row in rows] == [
+                "Прежняя задача",
+                "Прежний ответ",
+                "Новая задача",
+                "Новый ответ",
+            ]
+            assert [row["id"] for row in rows] == sorted(row["id"] for row in rows)
+            assert history.recorded == {"user-old", "user-new"}
+            assert not await history.page(before=rows[0]["id"])
+            assert len([c for c in fake.calls if c["method"] == "thread/items/list"]) == 1
+            turns = [c["params"] for c in fake.calls if c["method"] == "thread/turns/list"]
+            assert [p.get("cursor") for p in turns] == [None, "older"]
+            assert all(p["itemsView"] == "full" and p["limit"] == 1 for p in turns)
+        finally:
+            await app.close()
+
+
+async def test_history_rejection_does_not_hide_failure_or_change_backend(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.items_error = "история недоступна"
+    async with fake.running() as endpoint:
+        app = AppServer(endpoint)
+        await app.open()
+        try:
+            with pytest.raises(RPCRejected, match="история недоступна"):
+                await app.items("current", None, 50)
+            assert not app.turn_history
+            assert not any(c["method"] == "thread/turns/list" for c in fake.calls)
+        finally:
+            await app.close()
 
 
 async def test_attach_uses_sdk_and_preserves_settings(tmp_path):

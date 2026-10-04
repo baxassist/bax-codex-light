@@ -21,6 +21,10 @@ class ProjectApp(FakeApp):
         self.threads["foreign"] = thread(project.parent, thread_id="foreign")
         self.archived = set()
         self.created = 0
+        self.unmaterialized = set()
+        self.empty = set()
+        self.name_error = False
+        self.hide_empty = False
         self.settings = {
             "cwd": str(project),
             "model": "chosen-model",
@@ -51,6 +55,19 @@ class ProjectApp(FakeApp):
                     continue
                 method, params = message["method"], message.get("params", {})
                 tid = params.get("threadId")
+                if (
+                    method in {"thread/resume", "thread/items/list", "thread/turns/list"}
+                    and tid in self.unmaterialized
+                ):
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": message["id"],
+                                "error": {"code": -32600, "message": f"no rollout found for thread id {tid}"},
+                            }
+                        )
+                    )
+                    continue
                 if method == "initialize":
                     result = {"userAgent": "fake/0.160.0"}
                 elif method == "thread/read":
@@ -66,6 +83,7 @@ class ProjectApp(FakeApp):
                             t
                             for key, t in self.threads.items()
                             if (key in self.archived) == params.get("archived", False)
+                            and not (self.hide_empty and key in self.empty and key not in self.archived)
                         ],
                         "nextCursor": None,
                     }
@@ -73,9 +91,26 @@ class ProjectApp(FakeApp):
                     self.created += 1
                     tid = f"new-{self.created}"
                     self.threads[tid] = thread(self.project, thread_id=tid)
+                    self.threads[tid]["historyMode"] = params.get("historyMode", "paginated")
+                    self.unmaterialized.add(tid)
+                    self.empty.add(tid)
                     result = {"thread": self.threads[tid], **self.settings}
                     if self.mismatch_model:
                         result["model"] = "wrong-model"
+                elif method == "thread/name/set":
+                    if self.name_error:
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "id": message["id"],
+                                    "error": {"code": -32600, "message": "не удалось сохранить новую сессию"},
+                                }
+                            )
+                        )
+                        continue
+                    self.unmaterialized.discard(tid)
+                    self.threads[tid]["name"] = params["name"]
+                    result = {}
                 elif method == "thread/archive":
                     self.archived.add(tid)
                     self.threads[tid]["status"] = {"type": "notLoaded"}
@@ -85,7 +120,10 @@ class ProjectApp(FakeApp):
                     self.threads[tid]["status"] = {"type": "idle"}
                     result = {"thread": self.threads[tid]}
                 elif method == "thread/items/list":
-                    result = {"data": [entry(f"answer-{tid}", text=f"История {tid}")], "nextCursor": None}
+                    result = {
+                        "data": [] if tid in self.empty else [entry(f"answer-{tid}", text=f"История {tid}")],
+                        "nextCursor": None,
+                    }
                 elif method == "thread/turns/list":
                     result = {
                         "data": [{"id": f"turn-{tid}", "status": "inProgress", "items": []}]
@@ -93,6 +131,10 @@ class ProjectApp(FakeApp):
                         else []
                     }
                 elif method in {"turn/start", "turn/steer"}:
+                    self.empty.discard(tid)
+                    self.threads[tid]["preview"] = next(
+                        (part["text"] for part in params.get("input", []) if part["type"] == "text"), ""
+                    )
                     self.threads[tid]["status"] = {"type": "active", "activeFlags": []}
                     result = (
                         {"turn": {"id": f"turn-{tid}", "status": "inProgress", "items": []}}
@@ -208,6 +250,11 @@ async def test_new_thread_inherits_actual_settings_and_leaves_background_running
         assert params["config"]["sandbox_workspace_write"]["network_access"] is False
         assert params["cwd"] == str(tmp_path)
         assert not any(c["method"] == "turn/interrupt" for c in fake.calls)
+        saved = next(c for c in fake.calls if c["method"] == "thread/name/set")
+        assert saved["params"] == {"threadId": "new-1", "name": "Новая сессия"}
+        assert "new-1" not in fake.unmaterialized
+        assert not await owner.sessions["new-1"].history.page()
+        assert not any(c["method"] == "turn/start" for c in fake.calls)
 
 
 async def test_new_thread_refuses_changed_settings_without_submitting_task(tmp_path):
@@ -218,6 +265,60 @@ async def test_new_thread_refuses_changed_settings_without_submitting_task(tmp_p
         assert owner.selected == "a"
         assert owner.relay.frames[-1]["type"] == "error"
         assert not any(c["method"] == "turn/start" for c in fake.calls)
+        assert not any(c["method"] == "thread/name/set" for c in fake.calls)
+
+
+async def test_new_thread_save_failure_keeps_previous_selection_and_work(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        fake.threads["a"]["status"] = {"type": "active", "activeFlags": []}
+        fake.name_error = True
+        await owner.on_frame(
+            {"type": "session.select", "session": "new", "expected_session": "a", "rid": "new"}
+        )
+        assert owner.selected == "a" and owner.sessions["a"].state == "busy"
+        assert owner.relay.frames[-1]["type"] == "error"
+        assert owner.relay.frames[-1]["rid"] == "new"
+        assert fake.unmaterialized == {"new-1"}
+        assert not any(c["method"] in {"turn/start", "turn/interrupt"} for c in fake.calls)
+        assert not any(
+            c["method"] == "thread/resume" and c["params"]["threadId"] == "new-1" for c in fake.calls
+        )
+
+
+async def test_new_empty_session_can_be_reselected_and_first_message_is_sent_once(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        await owner.select("new")
+        await owner.select("b")
+        await owner.select("new-1")
+        await owner.on_frame({"type": "run", "session": "new-1", "text": "Правим вход", "client_id": "first"})
+        calls = [c for c in fake.calls if c["method"] == "turn/start"]
+        assert len(calls) == 1 and calls[0]["params"]["threadId"] == "new-1"
+        assert calls[0]["params"]["input"] == [{"type": "text", "text": "Правим вход"}]
+        await owner.send_sessions()
+        current = next(row for row in owner.relay.frames[-1]["items"] if row["session"] == "new-1")
+        assert current["title"] == "Правим вход"
+        fake.threads["new-1"]["name"] = "Название из Codex"
+        await owner.send_sessions()
+        current = next(row for row in owner.relay.frames[-1]["items"] if row["session"] == "new-1")
+        assert current["title"] == "Название из Codex"
+
+
+async def test_loaded_empty_sessions_stay_visible_before_codex_lists_them(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        fake.hide_empty = True
+        await owner.select("a")
+        await owner.select("new")
+        await owner.select("new")
+        await owner.send_sessions()
+        rows = owner.relay.frames[-1]["items"]
+        assert {row["session"] for row in rows} == {"a", "b", "new-1", "new-2"}
+        assert len(rows) == 4 and next(r for r in rows if r["current"])["session"] == "new-2"
+        await owner.close_session("new-1", "close")
+        assert "new-1" not in {row["session"] for row in owner.relay.frames[-1]["items"]}
+        await owner.send_sessions(archived=True)
+        assert [row["session"] for row in owner.relay.frames[-1]["items"]] == ["new-1"]
 
 
 async def test_stale_run_and_switch_do_not_retarget_messages(tmp_path):

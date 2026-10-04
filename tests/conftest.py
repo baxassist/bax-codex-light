@@ -50,6 +50,8 @@ class FakeApp:
         self.responses = []
         self.connections = set()
         self.items = [entry("a", text="Последний ответ"), entry("u", "userMessage", "Задача")]
+        self.items_error = None
+        self.turn_pages = None
         self.started = asyncio.Event()
         self.approvals_reviewer = "user"
 
@@ -82,8 +84,25 @@ class FakeApp:
                 elif method == "thread/list":
                     result = {"data": [thread(self.project, state=self.state)], "nextCursor": None}
                 elif method == "thread/items/list":
+                    if self.items_error:
+                        await ws.send(
+                            json.dumps(
+                                {"id": message["id"], "error": {"code": -32600, "message": self.items_error}}
+                            )
+                        )
+                        continue
                     result = {"data": self.items, "nextCursor": None, "backwardsCursor": None}
                 elif method == "thread/turns/list":
+                    if self.turn_pages is not None:
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "id": message["id"],
+                                    "result": self.turn_pages[message["params"].get("cursor")],
+                                }
+                            )
+                        )
+                        continue
                     result = {
                         "data": [{"id": self.active_turn_id, "status": "inProgress", "items": []}]
                         if self.state == "active" and self.active_turn_id

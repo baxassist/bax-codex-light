@@ -13,11 +13,19 @@ from urllib.parse import urlsplit
 
 from openai_codex.generated import v2_all as schemas
 from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
+from pydantic import Field
 from websockets.asyncio.client import connect, unix_connect
 
 from . import __version__
 
 EventHandler = Callable[[dict], Awaitable[None]]
+EMPTY_THREAD_NAME = "Новая сессия"
+
+
+class ThreadStartWithHistoryParams(schemas.ThreadStartParams):
+    # SDK 0.160.0 знает тип формата, но ещё не включает экспериментальный параметр
+    # создания. Paginated creation не поддержан; выбираем штатный legacy contract.
+    history_mode: schemas.ThreadHistoryMode = Field(alias="historyMode")
 
 
 class RPCError(RuntimeError):
@@ -44,6 +52,7 @@ class AppServer:
         self.info: dict = {}
         self.approvals: dict = {}
         self.configurations: dict[str, dict] = {}
+        self.turn_history: set[str] = set()
 
     async def open(self, handler: EventHandler | None = None) -> None:
         self.handler = handler
@@ -224,7 +233,7 @@ class AppServer:
 
     async def new_thread(self, project: Path, template: dict) -> dict:
         config = {}
-        params = {"cwd": str(project), "serviceName": "bax_codex_light"}
+        params = {"cwd": str(project), "serviceName": "bax_codex_light", "historyMode": "legacy"}
         if template:
             for field in ("model", "modelProvider", "approvalPolicy", "approvalsReviewer", "serviceTier"):
                 if template.get(field) is not None:
@@ -254,13 +263,15 @@ class AppServer:
         if config:
             params["config"] = config
         result = await self.typed(
-            "thread/start", schemas.ThreadStartParams, schemas.ThreadStartResponse, params
+            "thread/start", ThreadStartWithHistoryParams, schemas.ThreadStartResponse, params
         )
         thread = result["thread"]
         thread_project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
         expected_project = await asyncio.to_thread(project.resolve)
         if thread_project != expected_project:
             raise RPCError("Codex создал разговор в другом проекте")
+        if thread.get("historyMode") != "legacy":
+            raise RPCError("Codex не сохранил поддерживаемый формат истории; новый разговор не выбран")
         self.configurations[thread["id"]] = result
         # Новый разговор ещё не получает задач, если сервер изменил выбранные настройки.
         for field in (
@@ -277,6 +288,15 @@ class AppServer:
                 raise RPCError(
                     f"Codex не сохранил настройку {field}; новый разговор {thread['id']} не выбран"
                 )
+        # thread/start подписывает нас на живой разговор, но его история появляется
+        # на диске отложенно. Штатное имя сохраняет пустую сессию без задания модели:
+        # после подтверждения доступны resume и пагинация истории.
+        await self.typed(
+            "thread/name/set",
+            schemas.ThreadSetNameParams,
+            schemas.ThreadSetNameResponse,
+            {"threadId": thread["id"], "name": EMPTY_THREAD_NAME},
+        )
         return thread
 
     async def archive_thread(self, thread_id: str) -> None:
@@ -310,17 +330,42 @@ class AppServer:
         )
 
     async def items(self, thread_id: str, cursor: str | None, limit: int) -> dict:
-        return await self.typed(
-            "thread/items/list",
-            schemas.ThreadItemsListParams,
-            schemas.ThreadItemsListResponse,
+        if thread_id not in self.turn_history:
+            try:
+                return await self.typed(
+                    "thread/items/list",
+                    schemas.ThreadItemsListParams,
+                    schemas.ThreadItemsListResponse,
+                    {"threadId": thread_id, "cursor": cursor, "limit": limit, "sortDirection": "desc"},
+                )
+            except RPCRejected as error:
+                if str(error) != "thread/items/list is not supported yet":
+                    raise
+                self.turn_history.add(thread_id)
+        # Legacy store не поддерживает item pagination. Один ход на запрос
+        # ограничивает размер ответа; курсор остаётся штатным курсором Codex.
+        page = await self.typed(
+            "thread/turns/list",
+            schemas.ThreadTurnsListParams,
+            schemas.ThreadTurnsListResponse,
             {
                 "threadId": thread_id,
                 "cursor": cursor,
-                "limit": limit,
+                "limit": 1,
                 "sortDirection": "desc",
+                "itemsView": "full",
             },
         )
+        return schemas.ThreadItemsListResponse.model_validate(
+            {
+                "data": [
+                    {"turnId": turn["id"], "item": item}
+                    for turn in page["data"]
+                    for item in reversed(turn["items"])
+                ],
+                "nextCursor": page.get("nextCursor"),
+            }
+        ).model_dump(mode="json", by_alias=True, exclude_none=True, exclude_unset=True)
 
     async def active_turn(self, thread_id: str) -> str:
         result = await self.typed(

@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from . import __version__, files
-from .appserver import AppServer, RPCError
+from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError
 from .bridge import SUPPORTS, Bridge, Submission
 from .connection import Relay, network_error
 from .history import History
@@ -31,6 +31,14 @@ CONFIG_FIELDS = (
     "activePermissionProfile",
     "serviceTier",
 )
+
+
+def session_title(thread: dict) -> str:
+    name = thread.get("name")
+    # После первого сообщения пустое служебное имя уступает содержательному превью.
+    return (
+        name if name and name != EMPTY_THREAD_NAME else thread.get("preview", "")[:100] or EMPTY_THREAD_NAME
+    )
 
 
 class SessionBridge(Bridge):
@@ -313,7 +321,7 @@ class ProjectController:
         await self.send(
             "session.changed",
             session=self.selected,
-            title=thread.get("name") or thread.get("preview", "")[:100] or "Новая сессия",
+            title=session_title(thread),
             rid=rid,
         )
         await self.send(
@@ -347,8 +355,21 @@ class ProjectController:
         if not self.app or self.app.closed.is_set():
             raise RPCError("Codex пока недоступен")
         page = await self.app.list_threads(self.project, archived=archived, cursor=cursor)
+        threads = list(page["data"])
+        if not archived and cursor is None:
+            # Codex не всегда включает чат без первого сообщения в thread/list.
+            # Добавляем только уже явно открытые и проверенные пустые разговоры.
+            listed = {thread["id"] for thread in threads}
+            threads.extend(
+                self.catalog[tid]
+                for tid, bridge in self.sessions.items()
+                if tid not in listed
+                and bridge.state != "offline"
+                and tid in self.catalog
+                and not self.catalog[tid].get("preview")
+            )
         rows = []
-        for thread in page["data"]:
+        for thread in threads:
             path = await asyncio.to_thread(Path(thread["cwd"]).resolve)
             if path != self.project or thread.get("parentThreadId"):
                 continue
@@ -358,7 +379,7 @@ class ProjectController:
             rows.append(
                 {
                     "session": thread["id"],
-                    "title": thread.get("name") or thread["preview"][:100] or "Новая сессия",
+                    "title": session_title(thread),
                     "updated_at": thread["updatedAt"],
                     "entries": 0,
                     "current": thread["id"] == self.selected,
@@ -370,6 +391,7 @@ class ProjectController:
                     "archived": archived,
                 }
             )
+        rows.sort(key=lambda row: (row["updated_at"], row["session"]), reverse=True)
         await self.send(
             "sessions",
             items=rows,
