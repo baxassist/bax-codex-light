@@ -79,6 +79,8 @@ class FakeApp:
                         "approvalsReviewer": self.approvals_reviewer,
                         "sandbox": {"type": "readOnly"},
                     }
+                elif method == "thread/list":
+                    result = {"data": [thread(self.project, state=self.state)], "nextCursor": None}
                 elif method == "thread/items/list":
                     result = {"data": self.items, "nextCursor": None, "backwardsCursor": None}
                 elif method == "thread/turns/list":

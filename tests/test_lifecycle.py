@@ -43,6 +43,7 @@ async def test_mcp_eof_disconnects_bound_bridge(tmp_path):
                 "-m",
                 "bax_codex_light",
                 "serve",
+                "--conversation-only",
                 "--project",
                 str(tmp_path),
                 "--thread",

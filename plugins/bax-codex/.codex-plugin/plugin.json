@@ -1,14 +1,14 @@
 {
   "name": "bax-codex",
-  "version": "0.3.8",
-  "description": "Связь текущего разговора Codex с Баксом на телефоне",
+  "version": "0.4.0",
+  "description": "Сессии проекта Codex и фоновая работа с телефона в Баксе",
   "repository": "https://github.com/baxassist/bax-codex-light",
   "homepage": "https://github.com/baxassist/bax-codex-light",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Bax Codex Lite",
-    "shortDescription": "Задачи с телефона в текущий разговор Codex",
+    "shortDescription": "Сессии проекта и фоновые задачи с телефона",
     "category": "Productivity"
   }
 }

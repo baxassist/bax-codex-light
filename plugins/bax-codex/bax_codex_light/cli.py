@@ -14,6 +14,7 @@ from pathlib import Path
 from . import __version__
 from .appserver import AppServer
 from .bridge import Bridge
+from .controller import ProjectClient, serve_controller
 from .mcp_server import create_server
 from .registry import Registration, Registry
 
@@ -22,19 +23,22 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Связь Бакса с уже открытой сессией Codex")
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
-    for command in ("connect", "status", "doctor", "serve"):
+    for command in ("connect", "status", "doctor", "serve", "controller"):
         child = commands.add_parser(command)
         child.add_argument(
             "--project", type=Path, default=Path(os.environ.get("BAX_CODEX_PROJECT", os.getcwd()))
         )
         child.add_argument("--registry", type=Path, default=None)
-        if command in {"serve", "doctor"}:
+        if command in {"serve", "doctor", "controller"}:
             child.add_argument(
                 "--thread",
                 default=os.environ.get("BAX_CODEX_THREAD_ID", os.environ.get("CODEX_THREAD_ID", "")),
             )
             child.add_argument("--app-server", default=os.environ.get("BAX_CODEX_APP_SERVER"))
         if command == "serve":
+            child.add_argument(
+                "--conversation-only", action="store_true", help="Прежний мост одного разговора"
+            )
             child.add_argument(
                 "--auto-project",
                 action="store_true",
@@ -118,8 +122,11 @@ def main() -> None:
             )
         elif args.command == "doctor":
             print(json.dumps(asyncio.run(doctor(args)), ensure_ascii=False, indent=2))
+        elif args.command == "controller":
+            asyncio.run(serve_controller(args.project, registry, args.app_server))
         else:
-            bridge = Bridge(
+            client = Bridge if args.conversation_only else ProjectClient
+            bridge = client(
                 None if args.auto_project else args.project, registry, args.thread, args.app_server
             )
             asyncio.run(create_server(bridge).run_stdio_async())

@@ -43,6 +43,7 @@ class AppServer:
         self.closed = asyncio.Event()
         self.info: dict = {}
         self.approvals: dict = {}
+        self.configurations: dict[str, dict] = {}
 
     async def open(self, handler: EventHandler | None = None) -> None:
         self.handler = handler
@@ -146,11 +147,19 @@ class AppServer:
             mode="json", by_alias=True, exclude_none=True, exclude_unset=True
         )
         response = await self.request(method, request)
-        return response_type.model_validate(response).model_dump(
+        result = response_type.model_validate(response).model_dump(
             mode="json", by_alias=True, exclude_none=True, exclude_unset=True
         )
+        # SDK 0.160.0 ещё не включает происхождение именованного профиля в ответах.
+        # Эффективный sandbox выше проверен штатным типом; сохраняем только ID профиля.
+        if method in {"thread/start", "thread/resume"} and response.get("activePermissionProfile"):
+            profile = response["activePermissionProfile"]
+            if not isinstance(profile, dict) or not isinstance(profile.get("id"), str) or not profile["id"]:
+                raise RPCError("Codex вернул неизвестный профиль доступа")
+            result["activePermissionProfile"] = {"id": profile["id"]}
+        return result
 
-    async def inspect(self, thread_id: str, project: Path | None = None) -> dict:
+    async def read_thread(self, thread_id: str, project: Path | None = None) -> dict:
         params = schemas.ThreadReadParams.model_validate({"threadId": thread_id, "includeTurns": False})
         raw = await self.request("thread/read", params.model_dump(by_alias=True, exclude_unset=True))
         result = schemas.ThreadReadResponse.model_validate(raw).model_dump(
@@ -161,14 +170,24 @@ class AppServer:
         expected_project = await asyncio.to_thread(project.resolve) if project else thread_project
         if thread["id"] != thread_id or thread_project != expected_project or not thread_project.is_dir():
             raise RPCError("ID сессии или её рабочий каталог не совпадает с выбранным проектом")
-        if thread["status"]["type"] in {"notLoaded", "systemError"}:
-            raise RPCError("Сессия не открыта в Codex. Мост не запускает закрытые сессии")
+        if thread.get("parentThreadId"):
+            raise RPCError("Дочерние разговоры обслуживает их основная сессия")
         if raw["thread"].get("canAcceptDirectInput") is False:
             raise RPCError("Эта сессия Codex не принимает прямые задачи")
         return thread
 
+    async def inspect(self, thread_id: str, project: Path | None = None) -> dict:
+        thread = await self.read_thread(thread_id, project)
+        if thread["status"]["type"] in {"notLoaded", "systemError"}:
+            raise RPCError("Сессия не открыта в Codex. Мост не запускает закрытые сессии")
+        return thread
+
     async def attach(self, thread_id: str, project: Path) -> dict:
         await self.inspect(thread_id, project)
+        return await self.resume_thread(thread_id, project)
+
+    async def resume_thread(self, thread_id: str, project: Path) -> dict:
+        await self.read_thread(thread_id, project)
         result = await self.typed(
             "thread/resume",
             schemas.ThreadResumeParams,
@@ -178,12 +197,117 @@ class AppServer:
         expected_project = await asyncio.to_thread(project.resolve)
         if result["thread"]["id"] != thread_id or result["thread"]["cwd"] != str(expected_project):
             raise RPCError("App-server подписал мост на другую сессию или проект")
+        if result["thread"]["status"]["type"] in {"notLoaded", "systemError"}:
+            raise RPCError("Codex не загрузил эту сессию; восстановите её из архива или повторите позже")
         self.approvals = {
             "policy": result["approvalPolicy"],
             "reviewer": result["approvalsReviewer"],
             "manual": result["approvalsReviewer"] == "user" and result["approvalPolicy"] != "never",
         }
+        self.configurations[thread_id] = result
         return result["thread"]
+
+    async def list_threads(self, project: Path, *, archived: bool = False, cursor: str | None = None) -> dict:
+        return await self.typed(
+            "thread/list",
+            schemas.ThreadListParams,
+            schemas.ThreadListResponse,
+            {
+                "cwd": str(project),
+                "archived": archived,
+                "cursor": cursor,
+                "limit": 50,
+                "sortKey": "updated_at",
+                "sourceKinds": ["cli", "vscode", "appServer"],
+            },
+        )
+
+    async def new_thread(self, project: Path, template: dict) -> dict:
+        config = {}
+        params = {"cwd": str(project), "serviceName": "bax_codex_light"}
+        if template:
+            for field in ("model", "modelProvider", "approvalPolicy", "approvalsReviewer", "serviceTier"):
+                if template.get(field) is not None:
+                    params[field] = template[field]
+            if template.get("reasoningEffort") is not None:
+                config["model_reasoning_effort"] = template["reasoningEffort"]
+            profile = template.get("activePermissionProfile")
+            if profile:
+                config["default_permissions"] = profile["id"]
+            else:
+                sandbox = template["sandbox"]
+                modes = {
+                    "readOnly": "read-only",
+                    "workspaceWrite": "workspace-write",
+                    "dangerFullAccess": "danger-full-access",
+                }
+                if sandbox["type"] not in modes:
+                    raise RPCError("Этот профиль доступа нельзя перенести: создайте разговор в Codex")
+                params["sandbox"] = modes[sandbox["type"]]
+                if sandbox["type"] == "workspaceWrite":
+                    config["sandbox_workspace_write"] = {
+                        "writable_roots": sandbox.get("writableRoots", []),
+                        "network_access": sandbox.get("networkAccess", False),
+                        "exclude_tmpdir_env_var": sandbox.get("excludeTmpdirEnvVar", False),
+                        "exclude_slash_tmp": sandbox.get("excludeSlashTmp", False),
+                    }
+        if config:
+            params["config"] = config
+        result = await self.typed(
+            "thread/start", schemas.ThreadStartParams, schemas.ThreadStartResponse, params
+        )
+        thread = result["thread"]
+        thread_project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
+        expected_project = await asyncio.to_thread(project.resolve)
+        if thread_project != expected_project:
+            raise RPCError("Codex создал разговор в другом проекте")
+        self.configurations[thread["id"]] = result
+        # Новый разговор ещё не получает задач, если сервер изменил выбранные настройки.
+        for field in (
+            "model",
+            "modelProvider",
+            "approvalPolicy",
+            "approvalsReviewer",
+            "reasoningEffort",
+            "sandbox",
+            "activePermissionProfile",
+            "serviceTier",
+        ):
+            if field in template and result.get(field) != template[field]:
+                raise RPCError(
+                    f"Codex не сохранил настройку {field}; новый разговор {thread['id']} не выбран"
+                )
+        return thread
+
+    async def archive_thread(self, thread_id: str) -> None:
+        await self.typed(
+            "thread/archive",
+            schemas.ThreadArchiveParams,
+            schemas.ThreadArchiveResponse,
+            {"threadId": thread_id},
+        )
+
+    async def unarchive_thread(self, thread_id: str, project: Path) -> dict:
+        await self.read_thread(thread_id, project)
+        result = await self.typed(
+            "thread/unarchive",
+            schemas.ThreadUnarchiveParams,
+            schemas.ThreadUnarchiveResponse,
+            {"threadId": thread_id},
+        )
+        thread_project = await asyncio.to_thread(Path(result["thread"]["cwd"]).resolve)
+        expected_project = await asyncio.to_thread(project.resolve)
+        if result["thread"]["id"] != thread_id or thread_project != expected_project:
+            raise RPCError("Codex восстановил другой разговор")
+        return result["thread"]
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        await self.typed(
+            "turn/interrupt",
+            schemas.TurnInterruptParams,
+            schemas.TurnInterruptResponse,
+            {"threadId": thread_id, "turnId": turn_id},
+        )
 
     async def items(self, thread_id: str, cursor: str | None, limit: int) -> dict:
         return await self.typed(
