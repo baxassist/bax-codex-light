@@ -98,6 +98,35 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             )
             fake.state = "idle"
             await fake.emit("thread/status/changed", {"threadId": "current", "status": {"type": "idle"}})
+            await fake.emit(
+                "item/completed",
+                {
+                    "threadId": "current",
+                    "turnId": "turn",
+                    "completedAtMs": 3,
+                    "item": {
+                        "id": "issuer",
+                        "type": "agentMessage",
+                        "delivery": "async",
+                        "text": "",
+                        "questions": [{"title": "Пришли Issuer ID"}],
+                    },
+                },
+            )
+            await until(lambda: any(m.get("type") == "question" for m in messages))
+            card = next(m for m in messages if m.get("type") == "question")
+            current = await session.call_tool("bax_status", {})
+            assert card["question_id"] in current.model_dump_json()
+            calls_before = len(fake.calls)
+            resolved = await session.call_tool("bax_resolve_question", {"question_id": card["question_id"]})
+            assert not resolved.is_error
+            await until(lambda: any(m.get("type") == "question.resolved" for m in messages))
+            closed = next(m for m in messages if m.get("type") == "question.resolved")
+            assert closed["question_id"] == card["question_id"] and closed["session"] == "current"
+            assert not any(
+                c["method"] in {"turn/start", "turn/steer", "turn/interrupt"}
+                for c in fake.calls[calls_before:]
+            )
         directory = runtime_path(project, Registry(tmp_path / "registry.json"), endpoint)
         status = await request(directory, "status")
         assert status["connected"] is True  # Закрытие MCP сохраняет канал проекта.

@@ -135,7 +135,7 @@ class ProjectController:
             Path(temp).unlink(missing_ok=True)
         self.saved = sessions
 
-    def status(self) -> dict:
+    def status(self, thread_id: str = "") -> dict:
         selected = self.sessions.get(self.selected)
         relay = self.relay
         unavailable = [s for tid, s in self.saved.items() if tid not in self.sessions]
@@ -154,6 +154,11 @@ class ProjectController:
             "delivery_errors": sum(bool(i.error) for s in self.sessions.values() for i in s.outbox.values())
             + sum(len(s.get("pending", {})) for s in unavailable),
             "pending_questions": sum(len(s.questions) for s in self.sessions.values()),
+            "async_questions": (
+                self.sessions[thread_id or self.selected].async_question_details()
+                if (thread_id or self.selected) in self.sessions
+                else []
+            ),
             "background_sessions": self.background_count,
             "error": self.error or (relay.error if relay else ""),
             "error_code": self.error_code or (relay.error_code if relay else ""),
@@ -484,6 +489,14 @@ class ProjectController:
         self.save()
         await self.publish_selection(rid)
         await self.send_sessions()
+
+    async def resolve_question(self, thread_id: str, question_id: str) -> dict:
+        bridge = self.sessions.get(thread_id)
+        if bridge is None:
+            raise ValueError("Этот разговор не подключён к проекту")
+        result = await bridge.resolve_question(question_id)
+        self.save()
+        return result
 
     async def on_event(self, event: dict) -> None:
         params = event.get("params", {})

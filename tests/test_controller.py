@@ -48,6 +48,27 @@ def test_controller_rejects_public_directory_and_symlink(tmp_path):
         private_directory(link)
 
 
+async def test_missing_mcp_context_can_identify_caller_without_selecting_it(tmp_path):
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        first = ProjectClient(tmp_path, registry, "a", endpoint)
+        directory = await first.ensure_controller()
+        try:
+            await first.bind("a")
+            observer = ProjectClient(None, registry, endpoint=endpoint)
+            status = await observer.status("b")
+            assert status["caller_thread_id"] == "b" and status["thread_id"] == "a"
+            assert status["needs_thread"]
+            with pytest.raises(ValueError, match="другому разговору"):
+                await observer.resolve_question("q", "a")
+            assert (await first.status())["thread_id"] == "a"
+            assert not any(c["method"] == "thread/start" for c in fake.calls)
+        finally:
+            await first.close()
+            await request(directory, "shutdown")
+
+
 @pytest.mark.parametrize("busy", [False, True])
 async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_path, monkeypatch, busy):
     import bax_codex_light.controller as controller

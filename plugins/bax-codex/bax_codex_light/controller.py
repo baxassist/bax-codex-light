@@ -74,7 +74,9 @@ async def serve_controller(project: Path, registry: Registry, endpoint: str | No
                     message = json.loads(payload)
                     method, params = message["method"], message.get("params", {})
                     if method == "status":
-                        result = controller.status()
+                        result = controller.status(params.get("thread_id", ""))
+                    elif method == "resolve_question":
+                        result = await controller.resolve_question(params["thread_id"], params["question_id"])
                     elif method == "attach":
                         result = await controller.attach(params["thread_id"])
                     elif method == "connect":
@@ -232,10 +234,28 @@ class ProjectClient:
                 except (OSError, TimeoutError):
                     await asyncio.sleep(0.05)
 
-    async def status(self) -> dict:
+    async def status(self, thread_id: str = "") -> dict:
+        if thread_id:
+            if self.thread_id and self.thread_id != thread_id:
+                raise ValueError("Этот MCP принадлежит другому разговору")
+            if not self.thread_id:
+                # Некоторые поверхности не передают ID в MCP. Проверяем явный ID
+                # через app-server, не выбирая и не возобновляя другую сессию.
+                app = AppServer(self.endpoint)
+                try:
+                    await app.open()
+                    thread = await app.inspect(thread_id, self.project)
+                    self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
+                    self.thread_id = thread_id
+                finally:
+                    await app.close()
         if self.project:
             try:
-                result = await request(runtime_path(self.project, self.registry, self.endpoint), "status")
+                result = await request(
+                    runtime_path(self.project, self.registry, self.endpoint),
+                    "status",
+                    thread_id=self.thread_id,
+                )
                 result["caller_thread_id"] = self.thread_id or None
                 result["needs_thread"] = not self.thread_id or result["thread_id"] != self.thread_id
                 return result
@@ -254,6 +274,17 @@ class ProjectClient:
             "error": self.error,
             "error_code": self.error_code,
         }
+
+    async def resolve_question(self, question_id: str, thread_id: str = "") -> dict:
+        await self.status(thread_id)
+        if not self.project or not self.thread_id:
+            raise ValueError("Нужен точный CODEX_THREAD_ID текущего разговора")
+        return await request(
+            runtime_path(self.project, self.registry, self.endpoint),
+            "resolve_question",
+            thread_id=self.thread_id,
+            question_id=question_id,
+        )
 
     async def bind(self, thread_id: str) -> dict:
         if not thread_id.strip():

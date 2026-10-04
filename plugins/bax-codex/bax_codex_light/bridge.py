@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,7 +66,9 @@ class Bridge:
         self.lock = asyncio.Lock()
         self.input_lock = asyncio.Lock()
 
-    def status(self) -> dict:
+    def status(self, thread_id: str = "") -> dict:
+        if thread_id and thread_id != self.thread_id:
+            raise ValueError("Этот MCP принадлежит другому разговору")
         error = self.error or (self.relay.error if self.relay else "")
         error_code = self.error_code or (self.relay.error_code if self.relay else "")
         needs_registration = False
@@ -86,6 +89,7 @@ class Bridge:
             "unconfirmed": len(self.outbox),
             "delivery_errors": sum(bool(item.error) for item in self.outbox.values()),
             "pending_questions": len(self.questions),
+            "async_questions": self.async_question_details(),
             "error": error,
             "error_code": error_code,
             "keep_awake": self.power_settings() if self.relay else None,
@@ -500,6 +504,7 @@ class Bridge:
             if view and view[1]:
                 item_id = identity(item)
                 if item.get("type") == "userMessage":
+                    await self.resolve_structured_answers(view[1])
                     self.history.recorded.add(item_id)
                     self.outbox.pop(item_id, None)
                 entry_id = self.history.live_id(item_id)
@@ -681,6 +686,40 @@ class Bridge:
             question = next(iter(self.questions.values()))
             await self.send("question", **question["card"])
 
+    def async_question_details(self) -> list[dict]:
+        return [
+            {"question_id": qid, "text": question["card"]["text"]}
+            for qid, question in self.questions.items()
+            if self.requests.get(question["request_id"], {}).get("method") == "agentMessage/asyncQuestion"
+        ]
+
+    async def resolve_question(self, question_id: str, thread_id: str = "") -> dict:
+        """Закрыть уже отвеченный обычным сообщением вопрос, без повторной отправки ответа."""
+        if thread_id and thread_id != self.thread_id:
+            raise ValueError("Этот MCP принадлежит другому разговору")
+        question = self.questions.get(question_id)
+        if question is None:
+            return {"question_id": question_id, "resolved": False}
+        request_id = question["request_id"]
+        request = self.requests[request_id]
+        if request["method"] != "agentMessage/asyncQuestion":
+            raise ValueError("Запрос разрешения закрывается только настоящим решением пользователя в Codex")
+        self.questions.pop(question_id)
+        if not any(qid in self.questions for qid in request["question_ids"]):
+            self.requests.pop(request_id)
+        await self.send("question.resolved", question_id=question_id)
+        await self.show_question()
+        return {"question_id": question_id, "resolved": True}
+
+    async def resolve_structured_answers(self, text: str) -> None:
+        # Структурированный ответ из консоли однозначно называет вопрос. Свободный
+        # текст не угадываем: модель закрывает конкретную карточку через MCP.
+        text = "\n".join(line.removeprefix("> ").strip() for line in text.splitlines())
+        for question in self.async_question_details():
+            title = question["text"].strip()
+            if re.search(r"(?m)^" + re.escape(title) + r"\s*\nОтвет:\s*\S", text):
+                await self.resolve_question(question["question_id"])
+
     async def answer(self, frame: dict) -> None:
         qid = frame.get("question_id")
         question = self.questions.get(qid)
@@ -712,6 +751,7 @@ class Bridge:
                 raise ValueError("Выберите один из предложенных вариантов")
             request["answers"][question["field_id"]] = {"answers": [option]}
             self.questions.pop(qid)
+            await self.send("question.resolved", question_id=qid)
             if any(other in self.questions for other in request["question_ids"]):
                 await self.show_question()
                 return

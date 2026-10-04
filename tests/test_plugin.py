@@ -80,5 +80,5 @@ def test_native_first_turn_waits_for_pending_plugin(installed_plugin, tmp_path):
     assert requests, result.stderr
     assert time.monotonic() - started >= 2.5
     tools = json.dumps(requests[0]["tools"], ensure_ascii=False)
-    for name in ("bax_status", "bax_attach", "bax_connect"):
+    for name in ("bax_status", "bax_attach", "bax_connect", "bax_resolve_question"):
         assert name in tools, f"{name} отсутствует в первом запросе Codex: {result.stderr}"

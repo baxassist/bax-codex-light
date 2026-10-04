@@ -202,6 +202,23 @@ async def test_switch_keeps_active_thread_queue_and_questions(tmp_path):
         assert not any(c["method"] in {"thread/archive", "turn/interrupt"} for c in fake.calls)
 
 
+async def test_resolve_answered_background_question_does_not_select_or_interrupt_it(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        a = owner.sessions["a"]
+        await a.async_questions({"id": "issuer", "questions": [{"title": "Issuer?"}]}, "turn-a")
+        qid = next(iter(a.questions))
+        await owner.select("b")
+        assert owner.status("a")["async_questions"] == [{"question_id": qid, "text": "Issuer?"}]
+        assert owner.status("b")["async_questions"] == []
+        assert not (await owner.resolve_question("b", qid))["resolved"]
+        assert qid in a.questions
+        assert (await owner.resolve_question("a", qid))["resolved"]
+        assert owner.selected == "b"
+        assert not any(c["method"] in {"turn/start", "turn/steer", "turn/interrupt"} for c in fake.calls)
+        assert {"type": "question.resolved", "session": "a", "question_id": qid} in owner.relay.frames
+
+
 async def test_background_deltas_and_answers_keep_exact_session(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")

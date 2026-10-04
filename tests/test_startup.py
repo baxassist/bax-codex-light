@@ -44,7 +44,12 @@ async def test_mcp_tools_available_when_exact_thread_socket_is_missing(tmp_path)
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await asyncio.wait_for(session.initialize(), 5)
         tools = await session.list_tools()
-        assert {tool.name for tool in tools.tools} == {"bax_status", "bax_attach", "bax_connect"}
+        assert {tool.name for tool in tools.tools} == {
+            "bax_status",
+            "bax_attach",
+            "bax_connect",
+            "bax_resolve_question",
+        }
         for _ in range(30):
             result = await session.call_tool("bax_status", {})
             assert not result.is_error

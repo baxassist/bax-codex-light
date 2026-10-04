@@ -189,3 +189,63 @@ async def test_uncertain_async_answer_is_not_sent_twice(tmp_path):
     assert not bridge.questions
     assert any(frame.get("code") == "delivery_uncertain" for frame in bridge.relay.sent)
     assert "private exception" not in str(bridge.relay.sent)
+
+
+@pytest.mark.parametrize("structured", [True, False])
+async def test_console_answer_closes_exact_async_card_without_resending_it(tmp_path, structured):
+    from conftest import entry
+    from test_bridge import bridge as make_bridge
+
+    bridge = make_bridge(tmp_path)
+    await bridge.async_questions(
+        {"id": "issuer", "questions": [{"title": "Пришли Issuer ID"}, {"title": "Путь APNs?"}]}, "turn"
+    )
+    first, second = list(bridge.questions)
+    text = "Пришли Issuer ID\nОтвет: already-received" if structured else "Issuer ID: already-received"
+    await bridge.on_event(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "current",
+                "turnId": "turn",
+                "item": entry("answer", "userMessage", text)["item"],
+            },
+        }
+    )
+    if not structured:
+        assert first in bridge.questions  # Свободный ответ требует понимания модели, не эвристики.
+        assert bridge.status()["async_questions"][0] == {"question_id": first, "text": "Пришли Issuer ID"}
+        assert (await bridge.resolve_question(first))["resolved"]
+    assert first not in bridge.questions and second in bridge.questions
+    assert any(f["type"] == "question.resolved" and f["question_id"] == first for f in bridge.relay.sent)
+    assert bridge.relay.sent[-1]["type"] in {"question", "message"}
+    assert not bridge.app.calls and not bridge.app.steers and not bridge.app.responses
+    assert not (await bridge.resolve_question(first))["resolved"]
+
+
+async def test_local_resolution_cannot_clear_permission_or_another_conversation(tmp_path):
+    from test_bridge import approval
+    from test_bridge import bridge as make_bridge
+
+    bridge = make_bridge(tmp_path)
+    await bridge.async_questions({"id": "issuer", "questions": [{"title": "Issuer?"}]}, "turn")
+    async_id = next(iter(bridge.questions))
+    with pytest.raises(ValueError, match="другому разговору"):
+        await bridge.resolve_question(async_id, "another")
+    await bridge.on_event(approval())
+    permission_id = next(q for q in bridge.questions if q != async_id)
+    with pytest.raises(ValueError, match="разрешения"):
+        await bridge.resolve_question(permission_id)
+    await bridge.resolve_structured_answers("Никаких ответов пока нет")
+    assert set(bridge.questions) == {async_id, permission_id}
+    assert not bridge.app.responses
+
+
+async def test_phone_answer_is_broadcast_as_resolved_to_other_devices(tmp_path):
+    from test_bridge import bridge as make_bridge
+
+    bridge = make_bridge(tmp_path)
+    await bridge.async_questions({"id": "q", "questions": [{"title": "Готово?"}]}, "turn")
+    qid = next(iter(bridge.questions))
+    await bridge.answer({"question_id": qid, "verdict": "choice", "option": "Да"})
+    assert any(f["type"] == "question.resolved" and f["question_id"] == qid for f in bridge.relay.sent)
