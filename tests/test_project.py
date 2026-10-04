@@ -41,6 +41,23 @@ class ProjectApp(FakeApp):
             },
         }
         self.mismatch_model = False
+        for value in self.threads.values():
+            value.update(model="chosen-model", reasoningEffort="high")
+        self.models = [
+            {
+                "id": model,
+                "model": model,
+                "displayName": model,
+                "description": "Тестовая модель",
+                "hidden": False,
+                "isDefault": model == "chosen-model",
+                "defaultReasoningEffort": efforts[0],
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": effort, "description": effort} for effort in efforts
+                ],
+            }
+            for model, efforts in [("chosen-model", ["high", "max"]), ("other-model", ["low", "medium"])]
+        ]
 
     async def handle(self, ws):
         self.connections.add(ws)
@@ -72,6 +89,8 @@ class ProjectApp(FakeApp):
                     result = {"userAgent": "fake/0.160.0"}
                 elif method == "thread/read":
                     result = {"thread": self.threads[tid]}
+                elif method == "model/list":
+                    result = {"data": self.models, "nextCursor": None}
                 elif method == "thread/resume":
                     self.threads[tid]["status"] = (
                         self.threads[tid]["status"] if tid not in self.archived else {"type": "notLoaded"}
@@ -131,6 +150,8 @@ class ProjectApp(FakeApp):
                         else []
                     }
                 elif method in {"turn/start", "turn/steer"}:
+                    if method == "turn/start" and "model" in params:
+                        self.threads[tid].update(model=params["model"], reasoningEffort=params["effort"])
                     self.empty.discard(tid)
                     self.threads[tid]["preview"] = next(
                         (part["text"] for part in params.get("input", []) if part["type"] == "text"), ""

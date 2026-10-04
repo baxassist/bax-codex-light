@@ -20,7 +20,15 @@ from .preferences import Preferences
 from .registry import Registration, Registry
 
 log = logging.getLogger(__name__)
-PROJECT_SUPPORTS = [*SUPPORTS, "sessions.list", "session.select", "session.close", "cancel"]
+PROJECT_SUPPORTS = [
+    *SUPPORTS,
+    "sessions.list",
+    "session.select",
+    "session.close",
+    "cancel",
+    "model.get",
+    "model.set",
+]
 CONFIG_FIELDS = (
     "model",
     "modelProvider",
@@ -47,6 +55,20 @@ class SessionBridge(Bridge):
         self.owner = owner
         self.app = owner.app
         self.history = History(self.app, thread_id)
+        self.model_selection: dict | None = None
+
+    def start_options(self) -> dict:
+        return dict(self.model_selection or {})
+
+    async def model_started(self) -> None:
+        if not self.model_selection:
+            return
+        thread = await self.app.read_thread(self.thread_id, self.project)
+        if self.owner.model_values(thread) == self.model_selection:
+            self.model_selection = None
+            self.owner.catalog[self.thread_id] = thread
+            self.owner.save()
+            await self.owner.send_model_settings(self.thread_id)
 
     async def send_history(self, before: int | None = None, limit: int = 50) -> None:
         await super().send_history(before, limit)
@@ -104,6 +126,7 @@ class ProjectController:
         sessions = dict(self.saved)
         for thread_id, bridge in self.sessions.items():
             sessions[thread_id] = {
+                "model_selection": bridge.model_selection,
                 "pending": {
                     cid: {
                         "text": item.text,
@@ -112,7 +135,7 @@ class ProjectController:
                         "image_count": item.image_count,
                     }
                     for cid, item in bridge.outbox.items()
-                }
+                },
             }
         self.state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, temp = tempfile.mkstemp(prefix=".project-", dir=self.state_path.parent)
@@ -255,6 +278,11 @@ class ProjectController:
         thread = await self.app.resume_thread(thread_id, self.project)
         if thread_id not in self.sessions:
             bridge = SessionBridge(self, thread_id)
+            selection = self.saved.get(thread_id, {}).get("model_selection")
+            if isinstance(selection, dict) and all(
+                isinstance(selection.get(k), str) and selection[k] for k in ("model", "effort")
+            ):
+                bridge.model_selection = {k: selection[k] for k in ("model", "effort")}
             for cid, pending in self.saved.get(thread_id, {}).get("pending", {}).items():
                 bridge.outbox[cid] = Submission(
                     pending["text"],
@@ -431,6 +459,9 @@ class ProjectController:
                         )
                     else:
                         await self.close_session(target, frame.get("rid"))
+            elif kind in {"model.get", "model.set"}:
+                async with self.lock:
+                    await self.model_command(frame)
             elif kind in {"power.get", "power.set"}:
                 if kind == "power.set":
                     enabled = frame.get("keep_awake")
@@ -463,6 +494,11 @@ class ProjectController:
                     await bridge.on_frame(frame)
                 self.save()
         except (ValueError, RPCError, TimeoutError, OSError) as error:
+            if frame.get("type") in {"model.get", "model.set"}:
+                await self.send(
+                    "model.settings", session=frame.get("session"), rid=frame.get("rid"), error=str(error)
+                )
+                return
             await self.send(
                 "error",
                 code="session_command_failed",
@@ -470,6 +506,62 @@ class ProjectController:
                 rid=frame.get("rid"),
                 session=frame.get("session"),
             )
+
+    @staticmethod
+    def model_values(thread: dict) -> dict:
+        return {"model": thread.get("model") or "", "effort": thread.get("reasoningEffort") or ""}
+
+    async def model_command(self, frame: dict) -> None:
+        target = frame.get("session")
+        if (
+            not isinstance(target, str)
+            or not target
+            or target != self.selected
+            or target not in self.sessions
+        ):
+            raise ValueError("Выбранный диалог изменился. Откройте модель и effort снова")
+        # Проверка cwd/ID выполняется тем же thread/read, что и для обычных команд.
+        thread = await self.app.read_thread(target, self.project)
+        catalog = await self.app.model_catalog()
+        if frame["type"] == "model.set":
+            model, effort = frame.get("model"), frame.get("effort")
+            choice = next((item for item in catalog if item["model"] == model), None)
+            if not choice or effort not in [
+                item["reasoningEffort"] for item in choice["supportedReasoningEfforts"]
+            ]:
+                raise ValueError("Эта модель или effort недоступны. Обновите список и повторите")
+            selection = {"model": model, "effort": effort}
+            bridge = self.sessions[target]
+            bridge.model_selection = None if selection == self.model_values(thread) else selection
+            self.save()
+        await self.send_model_settings(target, rid=frame.get("rid"), thread=thread, catalog=catalog)
+
+    async def send_model_settings(self, target: str, *, rid=None, thread=None, catalog=None) -> None:
+        bridge = self.sessions.get(target)
+        if not bridge:
+            return
+        thread = thread or await self.app.read_thread(target, self.project)
+        catalog = catalog if catalog is not None else await self.app.model_catalog()
+        current = self.model_values(thread)
+        selected = bridge.model_selection or current
+        await self.send(
+            "model.settings",
+            session=target,
+            rid=rid,
+            **selected,
+            current_model=current["model"],
+            current_effort=current["effort"],
+            pending=bool(bridge.model_selection),
+            models=[
+                {
+                    "model": item["model"],
+                    "name": item["displayName"],
+                    "default_effort": item["defaultReasoningEffort"],
+                    "efforts": [value["reasoningEffort"] for value in item["supportedReasoningEfforts"]],
+                }
+                for item in catalog
+            ],
+        )
 
     async def close_session(self, thread_id: str, rid: str | None) -> None:
         # Закрытие не останавливает чужую работу и не удаляет историю.
@@ -505,7 +597,19 @@ class ProjectController:
         if not bridge:
             return
         method = event["method"]
-        if method in {"thread/closed", "thread/archived"}:
+        if method == "thread/settings/updated":
+            settings = params.get("threadSettings", {})
+            thread = self.catalog.get(thread_id, {}).copy()
+            thread.update(model=settings.get("model"), reasoningEffort=settings.get("effort"))
+            self.catalog[thread_id] = thread
+            if bridge.model_selection == self.model_values(thread):
+                bridge.model_selection = None
+            if thread_id == self.selected:
+                # Новые разговоры наследуют подтверждённые параметры выбранного,
+                # остальные политики не меняются.
+                self.template.update(model=thread.get("model"), reasoningEffort=thread.get("reasoningEffort"))
+            await self.send_model_settings(thread_id, thread=thread)
+        elif method in {"thread/closed", "thread/archived"}:
             # Закрытие одного разговора не закрывает канал и другие разговоры проекта.
             bridge.state = "offline"
             for qid in list(bridge.questions):

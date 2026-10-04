@@ -374,6 +374,12 @@ class Bridge:
                 "message", id=self.history.preview_id(client_id), kind="user", text=submission.preview
             )
 
+    def start_options(self) -> dict:
+        return {}
+
+    async def model_started(self) -> None:
+        pass
+
     async def _drain(self) -> None:
         async with self.lock:
             rejected_steers = set()
@@ -406,8 +412,13 @@ class Bridge:
                     if target_turn:
                         await self.app.steer_turn(self.thread_id, target_turn, text, client_id, **extra)
                     else:
+                        extra.update(self.start_options())
                         result = await self.app.start_turn(self.thread_id, text, client_id, **extra)
                         self.turn_id = result["turn"]["id"]
+                        # Не превращаем уже принятое сообщение в ошибку доставки,
+                        # если дополнительный запрос настроек временно недоступен.
+                        with contextlib.suppress(RPCError, OSError, TimeoutError):
+                            await self.model_started()
                     # После приёма изображение хранит Codex; мост оставляет только метаданные эха.
                     submission.images = []
                     log.info("Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id)
@@ -509,7 +520,14 @@ class Bridge:
                     self.outbox.pop(item_id, None)
                 entry_id = self.history.live_id(item_id)
                 # Готовый ответ заменяет потоковую строку с тем же ID.
-                await self.send("message", id=entry_id, kind=view[0], text=view[1])
+                metadata = {}
+                if view[0] == "assistant" and hasattr(self.app, "response_metadata"):
+                    turn = params["turnId"]
+                    values = await self.app.response_metadata(
+                        self.thread_id, [{"turnId": turn, "item": item}]
+                    )
+                    metadata = values.get((turn, item["id"]), {})
+                await self.send("message", id=entry_id, kind=view[0], text=view[1], **metadata)
                 self.streamed.add(item["id"])
         elif method == "item/agentMessage/delta" and self.history:
             item_id = params["itemId"]

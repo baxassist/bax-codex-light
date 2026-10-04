@@ -96,12 +96,20 @@ class History:
         self._assign(chronological, newest=before is None and self.initialized)
         self.initialized = True
         rows: list[dict] = []
-        for entry in reversed(entries):
+        ordered = list(reversed(entries))
+        metadata = (
+            await self.app.response_metadata(self.thread_id, ordered)
+            if hasattr(self.app, "response_metadata")
+            else {}
+        )
+        for entry in ordered:
             item = entry["item"]
             view = render(item)
             if view is None or not view[1]:
                 continue
             row = {"id": self.ids[identity(item)], "kind": view[0], "text": view[1]}
+            if row["kind"] == "assistant":
+                row.update(metadata.get((entry.get("turnId", ""), item["id"]), {}))
             if row["kind"] in {"tool", "thinking"}:
                 if rows and rows[-1]["kind"] == "steps":
                     rows[-1].update(id=row["id"], text=row["text"], count=rows[-1]["count"] + 1)

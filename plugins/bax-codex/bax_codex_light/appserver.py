@@ -17,6 +17,7 @@ from pydantic import Field
 from websockets.asyncio.client import connect, unix_connect
 
 from . import __version__
+from .response_metadata import ResponseMetadata
 
 EventHandler = Callable[[dict], Awaitable[None]]
 EMPTY_THREAD_NAME = "Новая сессия"
@@ -53,6 +54,9 @@ class AppServer:
         self.approvals: dict = {}
         self.configurations: dict[str, dict] = {}
         self.turn_history: set[str] = set()
+        self.threads: dict[str, dict] = {}
+        self.metadata: dict[str, ResponseMetadata] = {}
+        self.metadata_lock = asyncio.Lock()
 
     async def open(self, handler: EventHandler | None = None) -> None:
         self.handler = handler
@@ -183,6 +187,7 @@ class AppServer:
             raise RPCError("Дочерние разговоры обслуживает их основная сессия")
         if raw["thread"].get("canAcceptDirectInput") is False:
             raise RPCError("Эта сессия Codex не принимает прямые задачи")
+        self.threads[thread_id] = thread
         return thread
 
     async def inspect(self, thread_id: str, project: Path | None = None) -> dict:
@@ -377,8 +382,44 @@ class AppServer:
         turn = next(iter(result["data"]), None)
         return turn["id"] if turn and turn["status"] == "inProgress" else ""
 
+    async def model_catalog(self) -> list[dict]:
+        items, cursor = [], None
+        for _ in range(20):
+            params = {"limit": 100, "includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            page = await self.typed("model/list", schemas.ModelListParams, schemas.ModelListResponse, params)
+            items.extend(item for item in page["data"] if not item["hidden"])
+            cursor = page.get("nextCursor")
+            if not cursor:
+                return items
+        raise RPCError("Каталог моделей слишком большой; повторите запрос позже")
+
+    async def response_metadata(self, thread_id: str, entries: list[dict]) -> dict:
+        async with self.metadata_lock:
+            thread = self.threads.get(thread_id)
+            if not thread:
+                return {}
+            home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+            value = self.metadata.get(thread_id)
+            try:
+                source = await asyncio.to_thread(Path(thread["path"]).resolve) if thread.get("path") else None
+                if not value or value.path != source:
+                    value = self.metadata[thread_id] = await asyncio.to_thread(ResponseMetadata, thread, home)
+                return await asyncio.to_thread(value.decorate, entries)
+            except (OSError, ValueError):
+                # Отсутствующий журнал не мешает истории; текущая модель не служит заменой.
+                return {}
+
     async def start_turn(
-        self, thread_id: str, text: str, client_id: str, *, images: list[dict] | None = None
+        self,
+        thread_id: str,
+        text: str,
+        client_id: str,
+        *,
+        images: list[dict] | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> dict:
         return await self.typed(
             "turn/start",
@@ -388,6 +429,7 @@ class AppServer:
                 "threadId": thread_id,
                 "clientUserMessageId": client_id,
                 "input": ([{"type": "text", "text": text}] if text else []) + (images or []),
+                **({"model": model, "effort": effort} if model is not None else {}),
             },
         )
 
