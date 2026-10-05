@@ -101,6 +101,7 @@ class ProjectController:
         self.endpoint = endpoint
         self.identity = "project:" + hashlib.sha256(str(self.project).encode()).hexdigest()[:32]
         self.compacting: set[str] = set()
+        self.compaction_baselines: dict[str, str | None] = {}
         self.selected = ""
         self.sessions: dict[str, SessionBridge] = {}
         self.saved: dict = {}
@@ -565,11 +566,31 @@ class ProjectController:
                     if kind == "session.compact":
                         if target in self.compacting:
                             raise ValueError("Сжатие этого разговора уже запущено")
+                        baseline = await self.app.compaction_history(target, self.project)
+                        self.compaction_baselines[target] = (
+                            baseline["items"][-1]["id"] if baseline["items"] else None
+                        )
                         self.compacting.add(target)
+                        # Подтверждаем запрос сразу; завершение приходит отдельно.
+                        await self.send(
+                            "context.history",
+                            session=target,
+                            rid=frame.get("rid"),
+                            compacting=True,
+                            **baseline,
+                        )
                         try:
                             await self.app.compact_thread(target, self.project)
+                        except TimeoutError:
+                            # Тайм-аут RPC не отменяет уже доставленную команду Codex.
+                            await self.send_context(
+                                target,
+                                error="Codex пока не подтвердил запуск. Проверяю журнал сжатия.",
+                            )
+                            return
                         except BaseException:
                             self.compacting.discard(target)
+                            self.compaction_baselines.pop(target, None)
                             raise
                     await self.send_context(target, frame.get("rid"))
             elif kind == "background.get":
@@ -637,6 +658,16 @@ class ProjectController:
 
     async def send_context(self, thread_id: str, rid=None, error=None) -> None:
         result = await self.app.compaction_history(thread_id, self.project)
+        if thread_id in self.compacting and result["available"] and result["items"]:
+            latest = result["items"][-1]["id"]
+            if latest != self.compaction_baselines.get(thread_id):
+                # Shared app-server может не прислать завершающее событие этому клиенту.
+                # Новая запись точного журнала подтверждает завершение без повторной команды.
+                self.compacting.discard(thread_id)
+                self.compaction_baselines.pop(thread_id, None)
+                self.sessions[thread_id].token_usage = await self.app.context_usage(thread_id)
+                await self.send_stats(thread_id)
+                error = None
         await self.send(
             "context.history",
             session=thread_id,
@@ -793,6 +824,7 @@ class ProjectController:
             or (method == "item/completed" and params.get("item", {}).get("type") == "contextCompaction")
         ):
             self.compacting.discard(thread_id)
+            self.compaction_baselines.pop(thread_id, None)
             failure = params.get("turn", {}).get("error") or {}
             await self.send_context(thread_id, error=failure.get("message"))
         if method != "item/agentMessage/delta":

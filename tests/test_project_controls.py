@@ -123,3 +123,45 @@ async def test_compact_rejects_native_busy_thread_without_interrupting_it(tmp_pa
         assert owner.relay.frames[-1]["type"] == "error"
         assert not owner.compacting
         assert not any(c["method"] in {"thread/compact/start", "turn/interrupt"} for c in fake.calls)
+
+
+async def test_compaction_ack_precedes_native_rpc_and_journal_recovers_missing_completion(tmp_path):
+    async with project_controller(tmp_path) as (_, owner):
+        await owner.select("a")
+        history = {"available": True, "items": [{"id": "old"}]}
+
+        async def get_history(*args):
+            return history
+
+        async def compact(*args):
+            assert owner.relay.frames[-1]["rid"] == "c"
+            assert owner.relay.frames[-1]["compacting"] is True
+
+        owner.app.compaction_history = get_history
+        owner.app.compact_thread = compact
+        await owner.on_frame({"type": "session.compact", "session": "a", "expected_session": "a", "rid": "c"})
+        await owner.send_context("a")
+        assert owner.compacting == {"a"}  # Старая запись не означает новый успех.
+        history["items"] = [{"id": "old"}, {"id": "new"}]
+        await owner.on_frame({"type": "context.get", "session": "a", "expected_session": "a", "rid": "poll"})
+        assert not owner.compacting and not owner.compaction_baselines
+        assert owner.relay.frames[-1]["compacting"] is False
+        assert owner.relay.frames[-1]["rid"] == "poll"
+        assert owner.relay.frames[-1]["items"][-1]["id"] == "new"
+
+
+async def test_compaction_rpc_timeout_does_not_report_cancelled_operation(tmp_path):
+    async with project_controller(tmp_path) as (_, owner):
+        await owner.select("a")
+
+        async def compact(*args):
+            raise TimeoutError()
+
+        owner.app.compact_thread = compact
+        await owner.on_frame({"type": "session.compact", "session": "a", "expected_session": "a", "rid": "c"})
+        assert owner.compacting == {"a"}
+        assert owner.relay.frames[-1]["compacting"] is True
+        assert "не подтвердил" in owner.relay.frames[-1]["error"]
+        await owner.on_event({"method": "thread/compacted", "params": {"threadId": "a", "turnId": "t"}})
+        assert not owner.compacting
+        assert not owner.relay.frames[-1]["error"]
