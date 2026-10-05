@@ -192,7 +192,8 @@ class AppServer:
 
     async def inspect(self, thread_id: str, project: Path | None = None) -> dict:
         thread = await self.read_thread(thread_id, project)
-        if thread["status"]["type"] in {"notLoaded", "systemError"}:
+        # systemError описывает сбой запроса в загруженном разговоре, а не его закрытие.
+        if thread["status"]["type"] == "notLoaded":
             raise RPCError("Сессия не открыта в Codex. Мост не запускает закрытые сессии")
         return thread
 
@@ -211,7 +212,7 @@ class AppServer:
         expected_project = await asyncio.to_thread(project.resolve)
         if result["thread"]["id"] != thread_id or result["thread"]["cwd"] != str(expected_project):
             raise RPCError("App-server подписал мост на другую сессию или проект")
-        if result["thread"]["status"]["type"] in {"notLoaded", "systemError"}:
+        if result["thread"]["status"]["type"] == "notLoaded":
             raise RPCError("Codex не загрузил эту сессию; восстановите её из архива или повторите позже")
         self.approvals = {
             "policy": result["approvalPolicy"],
@@ -381,6 +382,16 @@ class AppServer:
         )
         turn = next(iter(result["data"]), None)
         return turn["id"] if turn and turn["status"] == "inProgress" else ""
+
+    async def last_turn_error(self, thread_id: str) -> str:
+        result = await self.typed(
+            "thread/turns/list",
+            schemas.ThreadTurnsListParams,
+            schemas.ThreadTurnsListResponse,
+            {"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"},
+        )
+        turn = next(iter(result["data"]), None)
+        return (turn.get("error") or {}).get("message", "") if turn else ""
 
     async def model_catalog(self) -> list[dict]:
         items, cursor = [], None

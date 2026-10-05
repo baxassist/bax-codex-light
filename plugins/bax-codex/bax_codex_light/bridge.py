@@ -51,6 +51,7 @@ class Bridge:
         self.relay: Relay | None = None
         self.history: History | None = None
         self.state = "offline"
+        self.codex_status = "notLoaded"
         self.error = ""
         self.error_code = ""
         self.project_ready = asyncio.Event()
@@ -229,12 +230,13 @@ class Bridge:
 
     def _set_state(self, status: dict) -> None:
         kind = status.get("type")
+        self.codex_status = kind
         if kind == "active":
             flags = status.get("activeFlags", [])
             self.state = (
                 "waiting" if any(f in flags for f in ["waitingOnApproval", "waitingOnUserInput"]) else "busy"
             )
-        elif kind == "idle":
+        elif kind in {"idle", "systemError"}:
             self.state = "ready"
         else:
             self.state = "offline"
@@ -315,6 +317,19 @@ class Bridge:
         for row in sorted(rows, key=lambda row: row["id"]):
             await self.send("message", **row)
 
+    async def send_turn_failure(self) -> None:
+        try:
+            reason = await self.app.last_turn_error(self.thread_id)
+        except (RPCError, OSError, TimeoutError):
+            reason = ""
+        message = "Последний запрос Codex завершился ошибкой"
+        if reason:
+            message += f": {reason}"
+        message = message.rstrip(". ") + "."
+        if "model is at capacity" in reason.lower():
+            message += " Модель сейчас перегружена. Повторите запрос позже или выберите другую модель."
+        await self.send("error", code="codex_turn_failed", message=message)
+
     async def on_frame(self, frame: dict) -> None:
         try:
             kind = frame.get("type")
@@ -324,6 +339,8 @@ class Bridge:
                 await self.show_question()
                 await self.send("background", tasks=[])
                 await self.send("status", state=self.state)
+                if self.codex_status == "systemError":
+                    await self.send_turn_failure()
             elif kind == "history":
                 await self.send_history(
                     int(frame.get("before", 0)), max(1, min(int(frame.get("limit", 50)), 100))
@@ -488,6 +505,8 @@ class Bridge:
         if method == "thread/status/changed":
             self._set_state(params["status"])
             await self.send("status", state=self.state)
+            if params["status"]["type"] == "systemError":
+                await self.send_turn_failure()
             if self.state == "offline" and self.app:
                 await self.app.close()
             elif self.state in {"ready", "busy", "waiting"}:

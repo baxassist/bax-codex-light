@@ -147,7 +147,22 @@ class ProjectApp(FakeApp):
                     result = {
                         "data": [{"id": f"turn-{tid}", "status": "inProgress", "items": []}]
                         if self.threads[tid]["status"]["type"] == "active"
-                        else []
+                        else (
+                            [
+                                {
+                                    "id": f"turn-{tid}",
+                                    "status": "failed",
+                                    "error": {
+                                        "message": (
+                                            "Selected model is at capacity. Please try a different model."
+                                        )
+                                    },
+                                    "items": [],
+                                }
+                            ]
+                            if self.threads[tid]["status"]["type"] == "systemError"
+                            else []
+                        )
                     }
                 elif method in {"turn/start", "turn/steer"}:
                     if method == "turn/start" and "model" in params:
@@ -221,6 +236,61 @@ async def test_switch_keeps_active_thread_queue_and_questions(tmp_path):
         assert a.state == "busy" and list(a.queue) == [("pending", "Сообщение для a")]
         assert "qa" in a.questions and not owner.sessions["b"].questions
         assert not any(c["method"] in {"thread/archive", "turn/interrupt"} for c in fake.calls)
+
+
+async def test_system_error_session_opens_with_history_and_failure_reason(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        fake.threads["a"]["status"] = {"type": "systemError"}
+        await owner.send_sessions()
+        rows = next(frame["items"] for frame in owner.relay.frames if frame["type"] == "sessions")
+        assert next(row for row in rows if row["session"] == "a")["state"] == "ready"
+        await owner.select("a")
+        assert owner.selected == "a"
+        assert owner.sessions["a"].state == "ready"
+        assert any(
+            frame["type"] == "message" and frame.get("text") == "История a" for frame in owner.relay.frames
+        )
+        assert any(
+            frame["type"] == "error" and "Модель сейчас перегружена" in frame["message"]
+            for frame in owner.relay.frames
+        )
+        frames = owner.relay.frames
+        assert next(i for i, f in enumerate(frames) if f["type"] == "history.done") < next(
+            i for i, f in enumerate(frames) if f["type"] == "error"
+        )
+        owner.relay.frames.clear()
+        await owner.on_frame({"type": "subscribe"})
+        failures = [f for f in owner.relay.frames if f["type"] == "error"]
+        assert len(failures) == 1 and failures[0]["session"] == "a"
+        await owner.on_event(
+            {
+                "method": "thread/status/changed",
+                "params": {"threadId": "a", "status": {"type": "systemError"}},
+            }
+        )
+        assert owner.selected == "a"
+        assert not owner.app.closed.is_set()
+        await owner.on_frame({"type": "run", "session": "a", "text": "Повтори запрос"})
+        starts = [c["params"] for c in fake.calls if c["method"] == "turn/start"]
+        assert len(starts) == 1 and starts[0]["threadId"] == "a"
+        assert "model" not in starts[0] and "effort" not in starts[0]
+
+
+async def test_failure_details_unavailable_do_not_block_history(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        fake.threads["a"]["status"] = {"type": "systemError"}
+
+        async def unavailable(thread_id):
+            raise TimeoutError
+
+        owner.app.last_turn_error = unavailable
+        await owner.select("a")
+        assert owner.selected == "a" and owner.sessions["a"].state == "ready"
+        assert any(frame["type"] == "history.done" for frame in owner.relay.frames)
+        assert any(
+            frame.get("code") == "codex_turn_failed" and frame["session"] == "a"
+            for frame in owner.relay.frames
+        )
 
 
 async def test_resolve_answered_background_question_does_not_select_or_interrupt_it(tmp_path):

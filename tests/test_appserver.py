@@ -102,10 +102,9 @@ async def test_attach_uses_sdk_and_preserves_settings(tmp_path):
             await app.close()
 
 
-@pytest.mark.parametrize("state", ["notLoaded", "systemError"])
-async def test_never_resumes_closed_thread(tmp_path, state):
+async def test_never_resumes_closed_thread(tmp_path):
     fake = FakeApp(tmp_path)
-    fake.state = state
+    fake.state = "notLoaded"
     async with fake.running() as endpoint:
         app = AppServer(endpoint)
         try:
@@ -113,6 +112,49 @@ async def test_never_resumes_closed_thread(tmp_path, state):
             with pytest.raises(RPCError, match="не открыта"):
                 await app.attach("current", tmp_path)
             assert not any(c["method"] == "thread/resume" for c in fake.calls)
+        finally:
+            await app.close()
+
+
+async def test_phone_selection_rejects_thread_that_stays_not_loaded(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.state = "notLoaded"
+    async with fake.running() as endpoint:
+        app = AppServer(endpoint)
+        try:
+            await app.open()
+            with pytest.raises(RPCError, match="не загрузил"):
+                await app.resume_thread("current", tmp_path)
+            assert "current" not in app.configurations
+            assert not any(call["method"] == "turn/start" for call in fake.calls)
+        finally:
+            await app.close()
+
+
+async def test_failed_turn_does_not_close_thread_and_its_reason_is_available(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.state = "systemError"
+    fake.turn_pages = {
+        None: {
+            "data": [
+                {
+                    "id": "failed-turn",
+                    "status": "failed",
+                    "error": {"message": "model at capacity"},
+                    "items": [],
+                }
+            ],
+            "nextCursor": None,
+        }
+    }
+    async with fake.running() as endpoint:
+        app = AppServer(endpoint)
+        try:
+            await app.open()
+            assert (await app.attach("current", tmp_path))["status"]["type"] == "systemError"
+            assert await app.last_turn_error("current") == "model at capacity"
+            await app.start_turn("current", "Повтори", "retry")
+            assert any(call["method"] == "turn/start" for call in fake.calls)
         finally:
             await app.close()
 

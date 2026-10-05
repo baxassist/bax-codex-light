@@ -382,6 +382,8 @@ class ProjectController:
             await bridge.send_history()
             await bridge.show_question()
             await self.send("history.done", session=thread_id)
+            if bridge.codex_status == "systemError":
+                await bridge.send_turn_failure()
             await self.send_sessions()
 
     async def send_sessions(self, *, archived: bool = False, cursor: str | None = None) -> None:
@@ -408,7 +410,11 @@ class ProjectController:
                 continue
             self.catalog[thread["id"]] = thread
             bridge = self.sessions.get(thread["id"])
-            status = bridge.state if bridge else thread["status"]["type"]
+            status = (
+                bridge.state
+                if bridge
+                else ("ready" if thread["status"]["type"] == "systemError" else thread["status"]["type"])
+            )
             rows.append(
                 {
                     "session": thread["id"],
@@ -439,10 +445,13 @@ class ProjectController:
             kind = frame.get("type")
             if kind == "subscribe":
                 await self.on_ready()
-                if bridge := self.sessions.get(self.selected):
+                bridge = self.sessions.get(self.selected)
+                if bridge:
                     await bridge.send_history()
                     await bridge.show_question()
                 await self.send("history.done", session=self.selected)
+                if bridge and bridge.codex_status == "systemError":
+                    await bridge.send_turn_failure()
                 await self.send_sessions()
             elif kind == "sessions.list":
                 await self.send_sessions(archived=frame.get("archived") is True, cursor=frame.get("cursor"))
