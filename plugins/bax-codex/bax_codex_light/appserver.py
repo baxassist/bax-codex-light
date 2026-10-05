@@ -36,6 +36,10 @@ class RPCError(RuntimeError):
 class RPCRejected(RPCError):
     """Сервер явно отклонил запрос: в отличие от тайм-аута, ответ получен."""
 
+    def __init__(self, message: str, data: object = None):
+        super().__init__(message)
+        self.native_info = data.get("codexErrorInfo") if isinstance(data, dict) else None
+
 
 class AppServer:
     def __init__(self, endpoint: str | None = None, *, timeout: float = 20):
@@ -106,7 +110,10 @@ class AppServer:
                     if future is not None and not future.done():
                         if "error" in message:
                             future.set_exception(
-                                RPCRejected(str(message["error"].get("message", "RPC error")))
+                                RPCRejected(
+                                    str(message["error"].get("message", "RPC error")),
+                                    message["error"].get("data"),
+                                )
                             )
                         else:
                             future.set_result(message.get("result", {}))
@@ -446,7 +453,16 @@ class AppServer:
         turn = next(iter(result["data"]), None)
         return turn["id"] if turn and turn["status"] == "inProgress" else ""
 
-    async def last_turn_error(self, thread_id: str) -> str:
+    async def recent_turns(self, thread_id: str) -> list[dict]:
+        result = await self.typed(
+            "thread/turns/list",
+            schemas.ThreadTurnsListParams,
+            schemas.ThreadTurnsListResponse,
+            {"threadId": thread_id, "limit": 100, "sortDirection": "desc", "itemsView": "notLoaded"},
+        )
+        return list(reversed(result["data"]))
+
+    async def last_turn_failure(self, thread_id: str) -> dict:
         result = await self.typed(
             "thread/turns/list",
             schemas.ThreadTurnsListParams,
@@ -454,7 +470,11 @@ class AppServer:
             {"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"},
         )
         turn = next(iter(result["data"]), None)
-        return (turn.get("error") or {}).get("message", "") if turn else ""
+        return turn or {}
+
+    async def last_turn_error(self, thread_id: str) -> str:
+        turn = await self.last_turn_failure(thread_id)
+        return (turn.get("error") or {}).get("message", "")
 
     async def model_catalog(self) -> list[dict]:
         items, cursor = [], None

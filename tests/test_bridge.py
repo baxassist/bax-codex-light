@@ -42,6 +42,12 @@ class FakeApp:
     async def respond(self, request_id, result):
         self.responses.append((request_id, result))
 
+    async def recent_turns(self, thread_id):
+        return []
+
+    async def last_turn_failure(self, thread_id):
+        return {}
+
     async def items(self, thread_id, cursor, limit):
         return {"data": self.history_items, "nextCursor": None}
 
@@ -173,6 +179,7 @@ async def test_late_native_confirmation_removes_uncertainty_without_retry(tmp_pa
     await b.on_event({"method": "item/completed", "params": {"threadId": "current", "item": native["item"]}})
     confirmation = [frame for frame in b.relay.sent if frame["type"] == "message"][-1]
     assert confirmation["id"] == echo["id"]
+    assert any(f["type"] == "error.resolved" and f.get("delivery") == "accepted" for f in b.relay.sent)
     b.app.history_items = [native]
     b.relay.sent.clear()
     await b.on_frame({"type": "subscribe"})

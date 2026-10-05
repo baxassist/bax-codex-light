@@ -293,7 +293,8 @@ async def test_failure_details_unavailable_do_not_block_history(tmp_path):
         async def unavailable(thread_id):
             raise TimeoutError
 
-        owner.app.last_turn_error = unavailable
+        owner.app.last_turn_failure = unavailable
+        owner.app.recent_turns = unavailable
         await owner.select("a")
         assert owner.selected == "a" and owner.sessions["a"].state == "ready"
         assert any(frame["type"] == "history.done" for frame in owner.relay.frames)

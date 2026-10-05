@@ -130,7 +130,12 @@ class History:
             view = render(item)
             if view is None or not view[1]:
                 continue
-            row = {"id": self.ids[identity(item)], "kind": view[0], "text": view[1]}
+            row = {
+                "id": self.ids[identity(item)],
+                "kind": view[0],
+                "text": view[1],
+                "turn_id": entry.get("turnId", ""),
+            }
             if row["kind"] == "assistant":
                 row.update(metadata.get((entry.get("turnId", ""), item["id"]), {}))
             if row["kind"] in {"tool", "thinking"}:

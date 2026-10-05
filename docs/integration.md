@@ -144,3 +144,40 @@ interrupt или изменения параметров. Повтор во вр
 `available=false`. Текст сводки и предполагаемый инициатор не передаются.
 После native completion контроллер отправляет новый журнал; приложение также
 перечитывает его, пока окно открыто. Старые плагины не объявляют эти capabilities.
+
+## ERR-1: совместимые ошибки wire v1
+
+Расширение `error` не меняет `v=1`. Обязательны прежние `code`, `message`; optional:
+`error_id`, `scope` (`session`/`connection`), `source` (`codex`/`plugin`/`relay`/`app`),
+`operation`, `session`, `turn_id`, `rid`, `category`, `native_code`, `delivery`,
+`action`, `will_retry`. Идентификатор содержит операцию, ID хода/запроса и код;
+разговор входит в клиентский ключ. Одинаковый сбой через live/completed/subscribe
+обновляет одну карточку; одинаковый текст разных ходов не объединяется.
+
+`codex_turn_failed` означает сбой выполнения **принятого** хода (`delivery=accepted`),
+не потерю пользовательского сообщения. Категории: capacity, quota, rate_limit,
+context, authentication, permission, policy, request, provider, connection, history,
+timeout, delivery, unknown. Основной источник — официальный `codexErrorInfo`;
+для старого capacity-текста есть совместимый fallback. Неизвестный безопасный текст
+остаётся видимым. `additionalDetails`, raw RPC, credentials, URL и локальные пути
+в публичные подробности не попадают.
+
+`delivery=rejected` — подтверждённый отказ, `unknown` — нет подтверждения,
+`not_applicable` — операция не связана с приёмом задачи. Неизвестная доставка
+не повторяется автоматически. `rid` команды run сохраняется в outbox при перезапуске.
+Эхо означает приём мостом; выполнение модели подтверждается независимо.
+
+`will_retry=true` приходит только из native Codex: мост не повторяет запрос.
+При успехе `error.resolved` с `session`, `turn_id` снимает временную карточку;
+окончательные ошибки остаются в истории. При позднем подтверждении доставки
+`error.resolved` содержит `rid`, `error_id`, `delivery=accepted`: снимается только
+предупреждение соответствующей команды, а не ошибка выполнения модели. Последние 100 ходов читаются через
+`thread/turns/list` с `itemsView=notLoaded`; ошибки видимых ходов и последнего запроса
+приходят после `history.done`. Своя база переписки не создаётся.
+`sessions.items[].last_error` — optional описание последнего сбоя отдельно от
+доступности ready/busy. Новый ход очищает последнюю ошибку, сохраняя историческую.
+
+`action` — подсказка, без автоматического исполнения: choose_model, compact,
+check_limits, wait, open_codex, edit_request, check_history, reload_history, none.
+Для `model.settings` совместимый `error` дополнен `error_details` той же схемы.
+Старые клиенты читают безопасную строку, новые — причину и диагностические поля.

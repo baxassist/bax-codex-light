@@ -16,6 +16,7 @@ from . import __version__, files
 from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError, RPCRejected
 from .bridge import SUPPORTS, Bridge, Submission
 from .connection import Relay, network_error
+from .errors import failure_fields, safe_message
 from .history import History
 from .preferences import Preferences
 from .registry import Registration, Registry
@@ -143,6 +144,8 @@ class ProjectController:
                         "error": item.error,
                         "steer_allowed": item.steer_allowed,
                         "image_count": item.image_count,
+                        "request_id": item.request_id,
+                        "delivery": item.delivery,
                     }
                     for cid, item in bridge.outbox.items()
                 },
@@ -243,7 +246,7 @@ class ProjectController:
                         if self.selected == thread_id:
                             self.selected = ""
                         # Недоступная/архивная сессия не отменяет неопределённую доставку.
-                        self.saved.setdefault(thread_id, {})["error"] = str(error)
+                        self.saved.setdefault(thread_id, {})["error"] = safe_message(error)
                 registration = self.registry.get(self.project)
                 if not registration:
                     self.error_code = "registration_missing"
@@ -262,9 +265,17 @@ class ProjectController:
             except Exception as error:
                 self.error_code, self.error = network_error(error, "локальному серверу Codex")
                 if isinstance(error, RPCError):
-                    self.error_code, self.error = "codex_unavailable", str(error)
+                    self.error_code, self.error = "codex_unavailable", safe_message(error)
                 self.ready.set()
-                log.warning("%s", self.error)
+                log.warning("%s", safe_message(self.error))
+                if self.relay and self.relay.connected:
+                    with contextlib.suppress(Exception):
+                        await self.send(
+                            "error",
+                            **failure_fields(
+                                self.error_code, self.error, operation="connect", scope="connection"
+                            ),
+                        )
             finally:
                 self.save()
                 if relay_task:
@@ -304,6 +315,8 @@ class ProjectController:
                     or "Контроллер перезапущен. Проверьте историю перед повторной отправкой.",
                     steer_allowed=pending.get("steer_allowed", True),
                     image_count=pending.get("image_count", 0),
+                    request_id=pending.get("request_id"),
+                    delivery=pending.get("delivery", "unknown"),
                 )
             self.sessions[thread_id] = bridge
         bridge = self.sessions[thread_id]
@@ -386,7 +399,7 @@ class ProjectController:
             try:
                 items = await self.app.background_terminals(thread_id, self.project)
             except (RPCRejected, RPCError, ValueError, TimeoutError) as error:
-                errors.append(str(error))
+                errors.append(safe_message(error))
                 continue
             for item in items:
                 identity = thread_id + ":" + item["processId"]
@@ -452,8 +465,7 @@ class ProjectController:
             await bridge.send_history()
             await bridge.show_question()
             await self.send("history.done", session=thread_id)
-            if bridge.codex_status == "systemError":
-                await bridge.send_turn_failure()
+            await bridge.send_failures()
             await self.send_sessions()
 
     async def send_sessions(self, *, archived: bool = False, cursor: str | None = None) -> None:
@@ -498,6 +510,7 @@ class ProjectController:
                     if bridge
                     else len(self.saved.get(thread["id"], {}).get("pending", {})),
                     "archived": archived,
+                    "last_error": bridge.last_failure if bridge else None,
                 }
             )
         rows.sort(key=lambda row: (row["updated_at"], row["session"]), reverse=True)
@@ -520,8 +533,8 @@ class ProjectController:
                     await bridge.send_history()
                     await bridge.show_question()
                 await self.send("history.done", session=self.selected)
-                if bridge and bridge.codex_status == "systemError":
-                    await bridge.send_turn_failure()
+                if bridge:
+                    await bridge.send_failures()
                 await self.send_sessions()
             elif kind == "sessions.list":
                 await self.send_sessions(archived=frame.get("archived") is True, cursor=frame.get("cursor"))
@@ -644,15 +657,25 @@ class ProjectController:
                 self.save()
         except (ValueError, RPCError, TimeoutError, OSError) as error:
             if frame.get("type") in {"model.get", "model.set"}:
+                failure = failure_fields(
+                    "session_command_failed", error, operation=str(frame.get("type")), rid=frame.get("rid")
+                )
                 await self.send(
-                    "model.settings", session=frame.get("session"), rid=frame.get("rid"), error=str(error)
+                    "model.settings",
+                    session=frame.get("session"),
+                    rid=frame.get("rid"),
+                    error=failure["message"],
+                    error_details={**failure, "session": frame.get("session")},
                 )
                 return
             await self.send(
                 "error",
-                code="session_command_failed",
-                message=str(error),
-                rid=frame.get("rid"),
+                **failure_fields(
+                    "session_command_failed",
+                    error,
+                    operation=str(frame.get("type") or "command"),
+                    rid=frame.get("rid"),
+                ),
                 session=frame.get("session"),
             )
 
@@ -673,7 +696,7 @@ class ProjectController:
             session=thread_id,
             rid=rid,
             compacting=thread_id in self.compacting,
-            error=error,
+            error=safe_message(error) if error else None,
             **result,
         )
 

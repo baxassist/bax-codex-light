@@ -15,6 +15,7 @@ from . import __version__, attachments, files, images
 from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
+from .errors import failure_fields, safe_message
 from .history import History, identity, render
 from .preferences import Preferences
 from .registry import Registration, Registry
@@ -30,6 +31,8 @@ class Submission:
     error: str = ""
     # Поздний ответ на async-вопрос не вмешивается в другой уже активный ход.
     steer_allowed: bool = True
+    request_id: str | None = None
+    delivery: str = "unknown"
     images: list[dict] = field(default_factory=list)
     image_count: int = 0
     accepted_text: str | None = None
@@ -56,6 +59,9 @@ class Bridge:
         self.codex_status = "notLoaded"
         self.error = ""
         self.error_code = ""
+        self.last_failure: dict | None = None
+        self.failures: dict[str, dict] = {}
+        self.history_turns: set[str] = set()
         self.project_ready = asyncio.Event()
         self.questions: dict[str, dict] = {}
         self.requests: dict[int | str, dict] = {}
@@ -210,11 +216,11 @@ class Bridge:
                     )
                 elif isinstance(error, RPCError):
                     self.error_code = "codex_rpc"
-                    self.error = str(error)
+                    self.error = safe_message(error)
                 else:
                     self.error_code, self.error = network_error(error, "локальному серверу Codex")
                 self.project_ready.set()
-                log.warning("%s (код: %s)", self.error, self.error_code)
+                log.warning("%s (код: %s)", safe_message(self.error), self.error_code)
             finally:
                 self.questions.clear()
                 self.requests.clear()
@@ -292,13 +298,21 @@ class Bridge:
             "power.settings", **{**settings, "error": error or settings["error"]}, rid=frame.get("rid")
         )
 
+    async def confirm_submission(self, client_id: str) -> None:
+        submission = self.outbox.pop(client_id, None)
+        if submission and submission.error:
+            code = "delivery_rejected" if submission.delivery == "rejected" else "delivery_uncertain"
+            rid = submission.request_id or client_id
+            await self.send("error.resolved", error_id=f"run:{rid}:{code}", rid=rid, delivery="accepted")
+
     async def send_history(self, before: int | None = None, limit: int = 50) -> None:
         if not self.history:
             raise RPCError("Codex ещё не подключён")
         rows = await self.history.page(before, limit)
+        self.history_turns = {row["turn_id"] for row in rows if row.get("turn_id")}
         for client_id in list(self.outbox):
             if client_id in self.history.recorded:
-                self.outbox.pop(client_id)
+                await self.confirm_submission(client_id)
         if before is None:
             for client_id, submission in self.outbox.items():
                 rows.append(
@@ -306,6 +320,7 @@ class Bridge:
                         "id": self.history.preview_id(client_id),
                         "kind": "user",
                         "text": submission.preview,
+                        "rid": submission.request_id,
                         **(
                             {"accepted_text": submission.accepted_text}
                             if submission.accepted_text is not None
@@ -318,24 +333,77 @@ class Bridge:
                         {
                             "id": self.history.preview_id(client_id) + 1,
                             "kind": "error",
-                            "text": submission.error,
+                            "text": safe_message(submission.error),
+                            **failure_fields(
+                                "delivery_rejected"
+                                if submission.delivery == "rejected"
+                                else "delivery_uncertain",
+                                submission.error,
+                                operation="run",
+                                rid=submission.request_id or client_id,
+                                delivery=submission.delivery,
+                            ),
                         }
                     )
         for row in sorted(rows, key=lambda row: row["id"]):
             await self.send("message", **row)
 
-    async def send_turn_failure(self) -> None:
+    async def send_failures(self) -> None:
         try:
-            reason = await self.app.last_turn_error(self.thread_id)
+            turns = await self.app.recent_turns(self.thread_id)
         except (RPCError, OSError, TimeoutError):
-            reason = ""
-        message = "Последний запрос Codex завершился ошибкой"
-        if reason:
-            message += f": {reason}"
-        message = message.rstrip(". ") + "."
-        if "model is at capacity" in reason.lower():
-            message += " Модель сейчас перегружена. Повторите запрос позже или выберите другую модель."
-        await self.send("error", code="codex_turn_failed", message=message)
+            turns = []
+        sent = set()
+        for turn in turns:
+            if not turn.get("error") or (turn["id"] not in self.history_turns and turn != turns[-1]):
+                continue
+            await self.send_turn_failure(turn)
+            sent.add(self.last_failure["error_id"])
+        if turns and not turns[-1].get("error"):
+            self.last_failure = None
+        for key, fields in self.failures.copy().items():
+            if key not in sent and (fields["turn_id"] in self.history_turns or fields == self.last_failure):
+                await self.send("error", **fields)
+        if self.codex_status == "systemError" and not turns and not self.last_failure:
+            await self.send_turn_failure()
+
+    async def send_turn_failure(self, turn: dict | None = None, *, will_retry: bool = False) -> None:
+        if turn is None:
+            try:
+                turn = await self.app.last_turn_failure(self.thread_id)
+            except (RPCError, OSError, TimeoutError):
+                turn = {}
+        error = turn.get("error") or {}
+        fields = failure_fields(
+            "codex_turn_failed",
+            error.get("message") or "Последний запрос Codex завершился ошибкой",
+            operation="turn",
+            turn_id=turn.get("id") or self.turn_id,
+            delivery="accepted",
+            info=error.get("codexErrorInfo"),
+            will_retry=will_retry,
+        )
+        self.last_failure = None if will_retry else fields
+        if not will_retry:
+            self.failures[fields["error_id"]] = fields
+            if len(self.failures) > 100:
+                self.failures.pop(next(iter(self.failures)))
+        await self.send("error", **fields)
+
+    async def send_failure(
+        self,
+        code: str,
+        message: object,
+        *,
+        operation: str,
+        rid: str | None = None,
+        delivery: str = "not_applicable",
+        turn_id: str = "",
+    ) -> None:
+        await self.send(
+            "error",
+            **failure_fields(code, message, operation=operation, rid=rid, delivery=delivery, turn_id=turn_id),
+        )
 
     async def on_frame(self, frame: dict) -> None:
         try:
@@ -346,12 +414,13 @@ class Bridge:
                 await self.show_question()
                 await self.send("background", tasks=[])
                 await self.send("status", state=self.state)
-                if self.codex_status == "systemError":
-                    await self.send_turn_failure()
+                await self.send("history.done")
+                await self.send_failures()
             elif kind == "history":
                 await self.send_history(
                     int(frame.get("before", 0)), max(1, min(int(frame.get("limit", 50)), 100))
                 )
+                await self.send_failures()
             elif kind == "run":
                 await self.accept_run(frame)
                 await self._drain()
@@ -372,9 +441,20 @@ class Bridge:
                 result = await asyncio.to_thread(files.read, self.project, path, paths)
                 await self.send("file.text", path=path, **result)
             else:
-                await self.send("error", code="unsupported", message=f"Команда {kind!r} не поддерживается")
-        except (ValueError, RPCError, TimeoutError) as error:
-            await self.send("error", code="invalid_request", message=str(error))
+                await self.send_failure(
+                    "unsupported",
+                    f"Команда {kind!r} не поддерживается",
+                    operation=str(kind),
+                    rid=frame.get("rid"),
+                )
+        except (ValueError, RPCError, TimeoutError, OSError) as error:
+            await self.send_failure(
+                "invalid_request",
+                error,
+                operation=str(frame.get("type") or "command"),
+                rid=frame.get("rid"),
+                delivery="rejected" if frame.get("type") == "run" else "not_applicable",
+            )
 
     async def accept_run(self, frame: dict) -> None:
         # Подготовка большой картинки не меняет порядок следующих текстовых комментариев.
@@ -398,6 +478,7 @@ class Bridge:
                 images=picture_inputs,
                 image_count=len(picture_inputs),
                 accepted_text=frame["text"] if document_text else None,
+                request_id=frame.get("rid"),
             )
             self.outbox[client_id] = submission
             await self.send(
@@ -405,6 +486,7 @@ class Bridge:
                 id=self.history.preview_id(client_id),
                 kind="user",
                 text=submission.preview,
+                rid=submission.request_id,
                 **(
                     {"accepted_text": submission.accepted_text}
                     if submission.accepted_text is not None
@@ -472,7 +554,14 @@ class Bridge:
                                 "ожидающих сообщений."
                             )
                             self.outbox[client_id].error = message
-                            await self.send("error", code="delivery_rejected", message=message)
+                            self.outbox[client_id].delivery = "rejected"
+                            await self.send_failure(
+                                "delivery_rejected",
+                                message,
+                                operation="run",
+                                rid=self.outbox[client_id].request_id or client_id,
+                                delivery="rejected",
+                            )
                             return
                         self.queue.insert(index, (client_id, text))
                         if client_id not in rejected_steers:
@@ -480,27 +569,36 @@ class Bridge:
                             continue
                         await self.send(
                             "error",
-                            code="message_queued",
-                            message=(
+                            **failure_fields(
+                                "message_queued",
                                 "Codex пока не принял комментарий. Сообщение сохранено в очереди "
-                                "и будет доставлено, когда ход станет доступен."
+                                "и будет доставлено, когда ход станет доступен.",
+                                operation="run",
+                                rid=self.outbox[client_id].request_id or client_id,
                             ),
                         )
                         return
                     # Повтор требует решения человека; предварительное эхо остаётся
                     # видимым до подтверждения настоящей историей Codex.
                     message = (
-                        f"Codex отклонил сообщение: {error}"
+                        f"Codex отклонил сообщение: {safe_message(error)}"
                         if isinstance(error, RPCRejected)
                         else "Доставка задачи не подтверждена. Проверьте разговор перед повторной отправкой"
                     )
                     if submission := self.outbox.get(client_id):
                         submission.error = message
+                        submission.delivery = "rejected" if isinstance(error, RPCRejected) else "unknown"
                     log.warning("Codex: доставка сообщения %s — %s", client_id, type(error).__name__)
                     await self.send(
                         "error",
-                        code="delivery_rejected" if isinstance(error, RPCRejected) else "delivery_uncertain",
-                        message=message,
+                        **failure_fields(
+                            "delivery_rejected" if isinstance(error, RPCRejected) else "delivery_uncertain",
+                            message,
+                            operation="run",
+                            rid=self.outbox[client_id].request_id or client_id,
+                            delivery="rejected" if isinstance(error, RPCRejected) else "unknown",
+                            info=getattr(error, "native_info", None),
+                        ),
                     )
                     if isinstance(error, RPCRejected):
                         with contextlib.suppress(Exception):
@@ -532,12 +630,23 @@ class Bridge:
                 await self.app.close()
             elif self.state in {"ready", "busy", "waiting"}:
                 await self._drain()
+        elif method == "error":
+            await self.send_turn_failure(
+                {"id": params.get("turnId", ""), "error": params.get("error")},
+                will_retry=params.get("willRetry", False),
+            )
         elif method == "turn/started":
+            self.last_failure = None
             self.turn_id = params["turn"]["id"]
             self.state = "busy"
             await self.send("status", state=self.state)
             await self._drain()
         elif method == "turn/completed":
+            if params.get("turn", {}).get("error"):
+                await self.send_turn_failure(params["turn"])
+            else:
+                self.last_failure = None
+                await self.send("error.resolved", turn_id=params.get("turn", {}).get("id", ""))
             self.turn_id = ""
             # Асинхронный вопрос остаётся доступным и после завершения хода.
             for request_id, request in list(self.requests.items()):
@@ -557,7 +666,11 @@ class Bridge:
                 if item.get("type") == "userMessage":
                     await self.resolve_structured_answers(view[1])
                     self.history.recorded.add(item_id)
-                    self.outbox.pop(item_id, None)
+                    pending = self.outbox.get(item_id)
+                    if pending and pending.request_id:
+                        # Дополнительное подтверждение привязано к UUID команды телефона.
+                        await self.send("error.resolved", rid=pending.request_id, delivery="accepted")
+                    await self.confirm_submission(item_id)
                 entry_id = self.history.live_id(item_id)
                 # Готовый ответ заменяет потоковую строку с тем же ID.
                 metadata = {}
@@ -567,13 +680,14 @@ class Bridge:
                         self.thread_id, [{"turnId": turn, "item": item}]
                     )
                     metadata = values.get((turn, item["id"]), {})
+                metadata.setdefault("turn_id", params.get("turnId", ""))
                 await self.send("message", id=entry_id, kind=view[0], text=view[1], **metadata)
                 self.streamed.add(item["id"])
         elif method == "item/agentMessage/delta" and self.history:
             item_id = params["itemId"]
             entry_id = self.history.live_id(item_id)
             self.streamed.add(item_id)
-            await self.send("delta", id=entry_id, chunk=params["delta"])
+            await self.send("delta", id=entry_id, chunk=params["delta"], turn_id=params.get("turnId", ""))
         elif method == "serverRequest/resolved":
             request_id = params.get("requestId")
             resolved = [qid for qid, value in self.questions.items() if value["request_id"] == request_id]
@@ -612,8 +726,12 @@ class Bridge:
                 log.warning("Codex запросил доступ в неподдерживаемом формате; запрос остаётся в Codex")
                 await self.send(
                     "error",
-                    code="unsupported_permissions",
-                    message="Не удалось прочитать запрошенный доступ. Подтвердите этот запрос в самом Codex.",
+                    **failure_fields(
+                        "unsupported_permissions",
+                        "Не удалось прочитать запрошенный доступ. Подтвердите этот запрос в самом Codex.",
+                        operation="permission.request",
+                        turn_id=params.get("turnId", ""),
+                    ),
                 )
                 return
         self.requests[request_id] = {
@@ -858,7 +976,13 @@ class Bridge:
             except Exception:
                 message = "Доставка ответа не подтверждена. Проверьте разговор перед повторной отправкой."
                 self.outbox[client_id].error = message
-                await self.send("error", code="delivery_uncertain", message=message)
+                await self.send_failure(
+                    "delivery_uncertain",
+                    message,
+                    operation="run",
+                    rid=self.outbox[client_id].request_id or client_id,
+                    delivery="unknown",
+                )
                 return
         self.queue.append((client_id, text))
         await self._drain()
