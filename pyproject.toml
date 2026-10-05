@@ -1,6 +1,6 @@
 [project]
 name = "bax-codex-light-agent"
-version = "0.5.3"
+version = "0.5.4"
 description = "Контроллер проекта Codex для Бакса: сессии и фоновая работа"
 requires-python = ">=3.11"
 readme = "README.md"
