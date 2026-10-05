@@ -323,6 +323,24 @@ class AppServer:
         )
         self.threads[thread_id]["name"] = name
 
+    async def compact_thread(self, thread_id: str, project: Path) -> None:
+        thread = await self.read_thread(thread_id, project)
+        if thread["status"]["type"] != "idle":
+            raise ValueError("Дождитесь завершения текущего хода перед сжатием контекста")
+        await self.typed(
+            "thread/compact/start",
+            schemas.ThreadCompactStartParams,
+            schemas.ThreadCompactStartResponse,
+            {"threadId": thread_id},
+        )
+
+    async def compaction_history(self, thread_id: str, project: Path) -> dict:
+        await self.read_thread(thread_id, project)
+        await self.response_metadata(thread_id, [])
+        value = self.metadata.get(thread_id)
+        available = bool(value and value.last_read_ok and value.verified)
+        return {"available": available, "items": list(value.compactions[-100:]) if available else []}
+
     async def context_usage(self, thread_id: str) -> dict:
         await self.response_metadata(thread_id, [])
         value = self.metadata.get(thread_id)

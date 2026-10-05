@@ -84,4 +84,42 @@ async def test_failed_termination_is_never_reported_as_stopped(tmp_path):
         fake.terminated = False
         await owner.on_frame({"type": "background.stop", "session": "a", "task_id": "7"})
         assert owner.relay.frames[-1]["type"] == "error"
-        assert owner.backgrounds["a:7"]["status"] == "running"
+    assert owner.backgrounds["a:7"]["status"] == "running"
+
+
+async def test_manual_compact_is_exact_native_operation_and_cannot_repeat_while_pending(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        fake.calls.clear()
+        frame = {"type": "session.compact", "session": "a", "expected_session": "a", "rid": "c"}
+        await owner.on_frame(frame)
+        assert owner.relay.frames[-1]["type"] == "context.history"
+        assert owner.relay.frames[-1]["compacting"] is True
+        assert owner.relay.frames[-1]["available"] is False
+        assert owner.status()["state"] == "busy"
+        assert [c["params"] for c in fake.calls if c["method"] == "thread/compact/start"] == [
+            {"threadId": "a"}
+        ]
+        for target, expected in [("a", "a"), ("b", "a"), ("a", "old"), ("foreign", "a")]:
+            await owner.on_frame({**frame, "session": target, "expected_session": expected})
+            assert owner.relay.frames[-1]["type"] == "error"
+        assert sum(c["method"] == "thread/compact/start" for c in fake.calls) == 1
+        assert not any(
+            c["method"] in {"thread/resume", "turn/start", "turn/interrupt", "thread/start"}
+            for c in fake.calls
+        )
+        await owner.on_event({"method": "thread/compacted", "params": {"threadId": "a", "turnId": "t"}})
+        assert not owner.compacting and owner.relay.frames[-1]["compacting"] is False
+
+
+async def test_compact_rejects_native_busy_thread_without_interrupting_it(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        fake.threads["a"]["status"] = {"type": "active", "activeFlags": []}
+        fake.calls.clear()
+        await owner.on_frame(
+            {"type": "session.compact", "session": "a", "expected_session": "a", "rid": "busy"}
+        )
+        assert owner.relay.frames[-1]["type"] == "error"
+        assert not owner.compacting
+        assert not any(c["method"] in {"thread/compact/start", "turn/interrupt"} for c in fake.calls)

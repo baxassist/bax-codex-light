@@ -40,8 +40,11 @@ class ResponseMetadata:
         self.by_fingerprint: dict[tuple, list[dict]] = defaultdict(list)
         self.turns: dict[str, dict] = {}
         self.token_usage: dict = {}
+        self.compactions: list[dict] = []
+        self.last_read_ok = False
 
     def refresh(self) -> None:
+        self.last_read_ok = False
         if not self.path:
             return
         fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -56,6 +59,7 @@ class ResponseMetadata:
                 self.by_fingerprint.clear()
                 self.turns.clear()
                 self.token_usage = {}
+                self.compactions.clear()
             file.seek(self.offset)
             while line := file.readline(16 * 1024 * 1024):
                 if not line.endswith(b"\n"):
@@ -67,6 +71,7 @@ class ResponseMetadata:
                 except (ValueError, UnicodeError):
                     continue
                 self._record(row)
+            self.last_read_ok = True
 
     def _record(self, row: dict) -> None:
         kind, payload = row.get("type"), row.get("payload")
@@ -79,7 +84,23 @@ class ResponseMetadata:
             return
         if not self.verified:
             return
-        if kind == "turn_context":
+        if kind == "compacted":
+            try:
+                date = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+                if date.tzinfo is None:
+                    return
+                stamp = date.timestamp()
+            except (ValueError, KeyError, TypeError):
+                return
+            self.compactions.append(
+                {
+                    "id": f"{stamp}:{len(self.compactions)}",
+                    "at": stamp,
+                    "before": dict(self.token_usage) or None,
+                    "after": None,
+                }
+            )
+        elif kind == "turn_context":
             turn = payload.get("turn_id")
             if isinstance(turn, str) and turn and payload.get("cwd") == str(self.project):
                 self.context = {"turn_id": turn}
@@ -96,6 +117,8 @@ class ResponseMetadata:
             used, maximum = last.get("total_tokens"), info.get("model_context_window")
             if type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
                 self.token_usage = {"used": used, "max": maximum, "model": self.context.get("model", "")}
+                if self.compactions and self.compactions[-1]["after"] is None:
+                    self.compactions[-1]["after"] = dict(self.token_usage)
         elif (
             kind == "response_item"
             and payload.get("type") == "message"

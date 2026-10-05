@@ -112,3 +112,70 @@ def test_context_compaction_restores_space_then_next_requests_consume_it(tmp_pat
         metadata.refresh()
         assert metadata.token_usage == {"used": used, "max": 258400, "model": "gpt-6.1-sol"}
     assert (258400 - metadata.token_usage["used"]) * 100 // 258400 == 43
+
+
+def test_compaction_log_keeps_first_after_measurement_and_reloads_without_duplicates(tmp_path):
+    path, metadata = fixture(tmp_path)
+
+    def write(row):
+        with path.open("a") as file:
+            file.write(json.dumps(row) + "\n")
+
+    def tokens(used):
+        write(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"total_tokens": used},
+                        "total_token_usage": {"total_tokens": 9000000},
+                        "model_context_window": 258400,
+                    },
+                },
+            }
+        )
+
+    tokens(228013)
+    write(
+        {
+            "type": "compacted",
+            "timestamp": "2026-10-05T18:47:42Z",
+            "payload": {"message": "Секретный текст сводки не возвращается"},
+        }
+    )
+    metadata.refresh()
+    assert metadata.last_read_ok and metadata.compactions[0]["after"] is None
+    tokens(15717)
+    tokens(146901)
+    metadata.refresh()
+    metadata.refresh()
+    item = metadata.compactions[0]
+    assert len(metadata.compactions) == 1
+    assert item["before"]["used"] == 228013 and item["after"]["used"] == 15717
+    assert item["before"]["max"] == item["after"]["max"] == 258400
+    assert set(item) == {"id", "at", "before", "after"}
+    path.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "exact",
+                    "cwd": str(tmp_path),
+                },
+            }
+        )
+        + "\n"
+    )
+    metadata.refresh()
+    assert metadata.compactions == []
+
+
+def test_compaction_without_measurement_is_unknown_and_naive_time_is_rejected(tmp_path):
+    path, metadata = fixture(tmp_path)
+    with path.open("a") as file:
+        for stamp in ("2026-10-05T18:47:42", "2026-10-05T18:47:42Z"):
+            file.write(json.dumps({"type": "compacted", "timestamp": stamp, "payload": {}}) + "\n")
+    metadata.refresh()
+    assert len(metadata.compactions) == 1
+    assert metadata.compactions[0]["before"] is metadata.compactions[0]["after"] is None

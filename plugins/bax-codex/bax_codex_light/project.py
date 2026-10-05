@@ -32,6 +32,8 @@ PROJECT_SUPPORTS = [
     "cancel",
     "model.get",
     "model.set",
+    "session.compact",
+    "context.get",
 ]
 CONFIG_FIELDS = (
     "model",
@@ -98,6 +100,7 @@ class ProjectController:
         self.state_path = state_path
         self.endpoint = endpoint
         self.identity = "project:" + hashlib.sha256(str(self.project).encode()).hexdigest()[:32]
+        self.compacting: set[str] = set()
         self.selected = ""
         self.sessions: dict[str, SessionBridge] = {}
         self.saved: dict = {}
@@ -175,7 +178,7 @@ class ProjectController:
             "thread_id": self.selected or None,
             "controller_id": self.identity,
             "controller_pid": os.getpid(),
-            "state": selected.state if selected else "ready",
+            "state": "busy" if self.selected in self.compacting else selected.state if selected else "ready",
             "connected": bool(relay and relay.connected),
             "queued": sum(len(s.queue) for s in self.sessions.values()),
             "unconfirmed": sum(len(s.outbox) for s in self.sessions.values())
@@ -213,7 +216,11 @@ class ProjectController:
 
     @property
     def background_count(self) -> int:
-        return sum(s.state in {"busy", "waiting"} for tid, s in self.sessions.items() if tid != self.selected)
+        return sum(
+            s.state in {"busy", "waiting"} or tid in self.compacting
+            for tid, s in self.sessions.items()
+            if tid != self.selected
+        )
 
     async def start(self) -> None:
         if self.task is None or self.task.done():
@@ -544,6 +551,27 @@ class ProjectController:
                         await self.send_sessions(archived=frame.get("archived") is True)
                     else:
                         await self.close_session(target, frame.get("rid"))
+            elif kind in {"context.get", "session.compact"}:
+                async with self.lock:
+                    target = frame.get("session")
+                    if (
+                        not target
+                        or target != self.selected
+                        or frame.get("expected_session") != self.selected
+                    ):
+                        raise ValueError("Выбранная сессия изменилась; откройте её контекст заново")
+                    if target not in self.sessions:
+                        raise ValueError("Этот разговор не подключён к проекту")
+                    if kind == "session.compact":
+                        if target in self.compacting:
+                            raise ValueError("Сжатие этого разговора уже запущено")
+                        self.compacting.add(target)
+                        try:
+                            await self.app.compact_thread(target, self.project)
+                        except BaseException:
+                            self.compacting.discard(target)
+                            raise
+                    await self.send_context(target, frame.get("rid"))
             elif kind == "background.get":
                 await self.send_background()
             elif kind == "background.stop":
@@ -606,6 +634,17 @@ class ProjectController:
                 rid=frame.get("rid"),
                 session=frame.get("session"),
             )
+
+    async def send_context(self, thread_id: str, rid=None, error=None) -> None:
+        result = await self.app.compaction_history(thread_id, self.project)
+        await self.send(
+            "context.history",
+            session=thread_id,
+            rid=rid,
+            compacting=thread_id in self.compacting,
+            error=error,
+            **result,
+        )
 
     @staticmethod
     def model_values(thread: dict) -> dict:
@@ -749,6 +788,13 @@ class ProjectController:
                 await bridge.send("status", state="offline")
         else:
             await bridge.on_event(event)
+        if thread_id in self.compacting and (
+            method in {"thread/compacted", "turn/completed", "thread/closed", "thread/archived"}
+            or (method == "item/completed" and params.get("item", {}).get("type") == "contextCompaction")
+        ):
+            self.compacting.discard(thread_id)
+            failure = params.get("turn", {}).get("error") or {}
+            await self.send_context(thread_id, error=failure.get("message"))
         if method != "item/agentMessage/delta":
             self.save()
         if (
