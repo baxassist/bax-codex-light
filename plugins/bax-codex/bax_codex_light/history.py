@@ -40,6 +40,10 @@ def render(item: dict) -> tuple[str, str] | None:
     return None
 
 
+class HistoryOrderError(ValueError):
+    """Локальные номера больше не соответствуют истории Codex."""
+
+
 class History:
     def __init__(self, app: Any, thread_id: str):
         self.app = app
@@ -86,17 +90,36 @@ class History:
             next_cursor = result.get("nextCursor")
             if not next_cursor or conversation_count >= limit:
                 break
-        chronological = [identity(entry["item"]) for entry in reversed(entries)]
+        # Страницы могут перекрываться, если между запросами добавились события.
+        unique, seen = [], set()
+        for entry in entries:
+            item_id = identity(entry["item"])
+            if item_id not in seen:
+                unique.append(entry)
+                seen.add(item_id)
+        entries = list(reversed(unique))
+        chronological = [identity(entry["item"]) for entry in entries]
         self.recorded.update(
             identity(entry["item"]) for entry in entries if entry["item"].get("type") == "userMessage"
         )
         for item_id in chronological:
             if item_id in self.previews:
                 self.live_id(item_id)
-        self._assign(chronological, newest=before is None and self.initialized)
+        try:
+            self._assign(chronological, newest=before is None and self.initialized)
+        except HistoryOrderError:
+            if before is not None:
+                raise ValueError("История обновилась; заново откройте переписку") from None
+            # Полная загрузка заменяет ленту на телефоне (history.done). Новая шкала
+            # номеров восстанавливает порядок без изменения истории/разговора Codex.
+            self.low = self.high = max(self.high, max(self.previews.values(), default=0)) + (1 << 20)
+            self.ids = {}
+            self.previews = {}
+            self.cursors = {}
+            self._assign(chronological, newest=True)
         self.initialized = True
         rows: list[dict] = []
-        ordered = list(reversed(entries))
+        ordered = entries
         metadata = (
             await self.app.response_metadata(self.thread_id, ordered)
             if hasattr(self.app, "response_metadata")
@@ -123,30 +146,38 @@ class History:
 
     def _assign(self, chronological: list[str], *, newest: bool) -> None:
         """Вставка пропущенных элементов между известными, без изменения старых ID."""
+        ids = dict(self.ids)
+        known = [ids[item_id] for item_id in chronological if item_id in ids]
+        if any(left >= right for left, right in zip(known, known[1:], strict=False)):
+            raise HistoryOrderError("Порядок сообщений истории изменился")
+        low, high = self.low, self.high
         step = 1 << 20
         index = 0
         while index < len(chronological):
-            if chronological[index] in self.ids:
+            if chronological[index] in ids:
                 index += 1
                 continue
             end = index
-            while end < len(chronological) and chronological[end] not in self.ids:
+            while end < len(chronological) and chronological[end] not in ids:
                 end += 1
             count = end - index
-            left = self.ids.get(chronological[index - 1]) if index else None
-            right = self.ids.get(chronological[end]) if end < len(chronological) else None
+            left = ids.get(chronological[index - 1]) if index else None
+            right = ids.get(chronological[end]) if end < len(chronological) else None
             if left is None and right is None:
-                left = self.high if newest else self.low - step * (count + 1)
+                left = high if newest else low - step * (count + 1)
                 right = left + step * (count + 1)
             elif left is None:
-                left = min(self.low, right) - step * (count + 1)
+                left = min(low, right) - step * (count + 1)
             elif right is None:
-                right = max(self.high, left) + step * (count + 1)
+                right = max(high, left) + step * (count + 1)
             increment = (right - left) // (count + 1)
             if increment < 1:
-                raise ValueError("Слишком много вставок истории: перезапустите мост")
+                raise HistoryOrderError("Между номерами сообщений не осталось места")
             for offset, item_id in enumerate(chronological[index:end], 1):
-                self.ids[item_id] = left + increment * offset
-            self.low = min(self.low, self.ids[chronological[index]])
-            self.high = max(self.high, self.ids[chronological[end - 1]])
+                ids[item_id] = left + increment * offset
+            low = min(low, ids[chronological[index]])
+            high = max(high, ids[chronological[end - 1]])
             index = end
+
+        self.ids = ids
+        self.low, self.high = low, high

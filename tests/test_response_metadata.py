@@ -86,3 +86,29 @@ def test_disallowed_path_does_not_read_content_and_sdk_timestamp_is_kept(tmp_pat
     value["completedAtMs"] = 1791115200000
     assert metadata.path is None
     assert metadata.decorate([value])[("turn", "legacy")] == {"created_at": 1791115200}
+
+
+def test_context_compaction_restores_space_then_next_requests_consume_it(tmp_path):
+    path, metadata = fixture(tmp_path)
+    append(path, "current", "gpt-6.1-sol")
+    for used in (228013, 15717, 146901):
+        with path.open("a") as file:
+            file.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {"total_tokens": used},
+                                "total_token_usage": {"total_tokens": 9000000},
+                                "model_context_window": 258400,
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
+        metadata.refresh()
+        assert metadata.token_usage == {"used": used, "max": 258400, "model": "gpt-6.1-sol"}
+    assert (258400 - metadata.token_usage["used"]) * 100 // 258400 == 43

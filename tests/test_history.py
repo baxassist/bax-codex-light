@@ -84,3 +84,90 @@ def test_async_question_title_already_in_text_is_not_duplicated():
             ],
         }
     ) == ("assistant", "Как назвать проект?")
+
+
+async def test_full_reload_recovers_exhausted_ids_and_keeps_pagination_and_live_updates():
+    pages = Pages(
+        {
+            None: {
+                "data": [
+                    entry("right", text="right"),
+                    entry("insert", text="insert"),
+                    entry("left", "userMessage", "left"),
+                ],
+                "nextCursor": "older",
+            },
+            "older": {"data": [entry("old", "userMessage", "old")], "nextCursor": None},
+        }
+    )
+    history = History(pages, "current")
+    history.ids = {"left": 100, "right": 101}
+    history.low, history.high = 100, 101
+    history.initialized = True
+    history.cursors = {100: "obsolete"}
+    queued = history.preview_id("pending")
+    rows = await history.page(limit=2)
+    assert [r["text"] for r in rows] == ["left", "insert", "right"]
+    assert [r["id"] for r in rows] == sorted({r["id"] for r in rows})
+    assert rows[0]["id"] > queued
+    assert history.preview_id("pending") > rows[-1]["id"]
+    assert await history.page(limit=2) == rows
+    older = await history.page(rows[0]["id"], 2)
+    assert older[0]["id"] < rows[0]["id"]
+    assert history.live_id("next") > rows[-1]["id"]
+    assert "left" in history.recorded
+    assert 100 not in history.cursors
+
+
+async def test_full_reload_recovers_reordered_live_anchors():
+    pages = Pages(
+        {
+            None: {
+                "data": [
+                    entry("right", text="right"),
+                    entry("missing", text="missing"),
+                    entry("left", text="left"),
+                ],
+                "nextCursor": None,
+            }
+        }
+    )
+    history = History(pages, "current")
+    history.live_id("right")
+    history.live_id("left")
+    rows = await history.page()
+    assert [r["text"] for r in rows] == ["left", "missing", "right"]
+    assert [r["id"] for r in rows] == sorted({r["id"] for r in rows})
+    assert await history.page() == rows
+
+
+async def test_many_late_insertions_do_not_exhaust_the_bridge():
+    pages = Pages(
+        {None: {"data": [entry("right", text="right"), entry("left", text="left")], "nextCursor": None}}
+    )
+    history = History(pages, "current")
+    await history.page()
+    chronological = ["left", "right"]
+    for n in range(100):
+        chronological.insert(1, f"late-{n}")
+        pages.pages[None]["data"] = [entry(item_id, text=item_id) for item_id in reversed(chronological)]
+        rows = await history.page(limit=1000)
+        assert [r["text"] for r in rows] == chronological
+        assert [r["id"] for r in rows] == sorted({r["id"] for r in rows})
+
+
+async def test_overlapping_pages_do_not_duplicate_messages():
+    pages = Pages(
+        {
+            None: {
+                "data": [entry("latest", text="latest"), entry("overlap", text="overlap")],
+                "nextCursor": "older",
+            },
+            "older": {
+                "data": [entry("overlap", text="overlap"), entry("old", "userMessage", "old")],
+                "nextCursor": None,
+            },
+        }
+    )
+    rows = await History(pages, "current").page(limit=50)
+    assert [r["text"] for r in rows] == ["old", "overlap", "latest"]

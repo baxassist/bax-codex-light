@@ -553,3 +553,27 @@ async def test_creation_with_named_permission_profile_preserves_profile(tmp_path
         await owner.select("new")
         params = next(c["params"] for c in fake.calls if c["method"] == "thread/start")
         assert params["config"]["default_permissions"] == "chosen-profile" and "sandbox" not in params
+
+
+async def test_subscribe_recovers_dense_history_without_changing_thread_or_permissions(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        bridge = owner.sessions["a"]
+
+        async def items(thread_id, cursor, limit):
+            assert thread_id == "a"
+            return {"data": [entry("right"), entry("missing"), entry("left")], "nextCursor": None}
+
+        bridge.app.items = items
+        bridge.history.ids = {"left": 100, "right": 101}
+        bridge.history.low, bridge.history.high = 100, 101
+        owner.relay.frames.clear()
+        fake.calls.clear()
+        await owner.on_frame({"type": "subscribe"})
+        messages = [f for f in owner.relay.frames if f["type"] == "message"]
+        assert len(messages) == 3
+        assert [f["id"] for f in messages] == sorted({f["id"] for f in messages})
+        assert any(f["type"] == "history.done" for f in owner.relay.frames)
+        assert not any(f["type"] == "error" for f in owner.relay.frames)
+        assert owner.selected == "a"
+        assert not any(c["method"] in {"thread/start", "turn/start", "turn/steer"} for c in fake.calls)
