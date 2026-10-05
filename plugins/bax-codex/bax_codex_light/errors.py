@@ -70,8 +70,10 @@ def failure_fields(
         low = reason.lower()
         if "model is at capacity" in low or http_status == 503:
             category, explanation, action = REASONS["serverOverloaded"]
-        elif http_status in {401, 403}:
+        elif http_status == 401:
             category, explanation, action = REASONS["unauthorized"]
+        elif http_status == 403:
+            category, explanation, action = "permission", "Провайдер запретил этот запрос.", "open_codex"
         elif http_status == 429:
             category, explanation, action = REASONS["rateLimitExceeded"]
         elif native_code in {
@@ -101,7 +103,7 @@ def failure_fields(
         action = "wait"
     actions = {
         "choose_model": "Повторите запрос позже или выберите другую модель.",
-        "check_limits": "Проверьте лимиты в Codex; время их обновления пока неизвестно.",
+        "check_limits": "Проверьте лимиты и время их обновления в Codex.",
         "wait": "Codex повторяет запрос самостоятельно." if will_retry else "Повторите запрос позже.",
         "compact": "Сожмите контекст или начните новый разговор.",
         "open_codex": "Проверьте настройки и сообщения в Codex на компьютере.",

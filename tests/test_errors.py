@@ -83,6 +83,13 @@ def test_rpc_native_cause_and_timeout_are_distinct():
     result = failure_fields("session_command_failed", TimeoutError(), operation="history")
     assert result["category"] == "history" and result["action"] == "reload_history"
     assert result["message"]
+    denied = failure_fields(
+        "codex_turn_failed",
+        "Forbidden",
+        operation="turn",
+        info={"httpConnectionFailed": {"httpStatusCode": 403}},
+    )
+    assert denied["category"] == "permission"
 
 
 def test_quoted_secret_and_jwt_redaction():
