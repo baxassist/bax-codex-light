@@ -9,10 +9,11 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from . import __version__, files
-from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError
+from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError, RPCRejected
 from .bridge import SUPPORTS, Bridge, Submission
 from .connection import Relay, network_error
 from .history import History
@@ -25,6 +26,9 @@ PROJECT_SUPPORTS = [
     "sessions.list",
     "session.select",
     "session.close",
+    "session.rename",
+    "background.get",
+    "background.stop",
     "cancel",
     "model.get",
     "model.set",
@@ -56,6 +60,7 @@ class SessionBridge(Bridge):
         self.app = owner.app
         self.history = History(self.app, thread_id)
         self.model_selection: dict | None = None
+        self.token_usage: dict = {}
 
     def start_options(self) -> dict:
         return dict(self.model_selection or {})
@@ -104,6 +109,7 @@ class ProjectController:
         self.lock = asyncio.Lock()
         self.error = self.error_code = ""
         self.catalog: dict[str, dict] = {}
+        self.backgrounds: dict[str, dict] = {}
         self.preferences = Preferences(registry.path.with_name(f"{registry.path.stem}-settings.json"))
         self.load()
 
@@ -348,6 +354,61 @@ class ProjectController:
         await self.send("power.settings", **self.power_settings())
         await self.publish_selection()
 
+    async def send_stats(self, thread_id: str) -> None:
+        bridge = self.sessions.get(thread_id)
+        if not bridge:
+            return
+        thread = self.catalog.get(thread_id, {})
+        config = self.app.configurations.get(thread_id, {})
+        model = thread.get("model") or config.get("model") or ""
+        effort = thread.get("reasoningEffort") or config.get("reasoningEffort") or ""
+        usage = bridge.token_usage or await self.app.context_usage(thread_id)
+        context = {"used": 0, "max": 0}
+        if not usage.get("model") or usage["model"] == model:
+            if "used" in usage and "max" in usage:
+                context = {key: usage[key] for key in ("used", "max")}
+        await self.send("stats", session=thread_id, model=model, effort=effort, context=context)
+
+    async def send_background(self) -> None:
+        running = set()
+        errors = []
+        for thread_id, bridge in list(self.sessions.items()):
+            if bridge.state == "offline":
+                continue
+            try:
+                items = await self.app.background_terminals(thread_id, self.project)
+            except (RPCRejected, RPCError, ValueError, TimeoutError) as error:
+                errors.append(str(error))
+                continue
+            for item in items:
+                identity = thread_id + ":" + item["processId"]
+                running.add(identity)
+                previous = self.backgrounds.get(identity, {})
+                self.backgrounds[identity] = {
+                    "id": identity,
+                    "task_id": item["processId"],
+                    "session": thread_id,
+                    "description": item["command"],
+                    "status": "running",
+                    "started_at": previous.get("started_at"),
+                }
+        if not errors:
+            for identity, task in self.backgrounds.items():
+                if task["status"] == "running" and identity not in running:
+                    task.update(status="finished", finished_at=time.time())
+        # Снимок только текущего контроллера; процесс другой сессии не переадресуется выбранной.
+        active = [task for task in self.backgrounds.values() if task["status"] == "running"]
+        finished = [task for task in self.backgrounds.values() if task["status"] != "running"][-100:]
+        tasks = [*active, *finished]
+        self.backgrounds = {task["id"]: task for task in tasks}
+        await self.send(
+            "background",
+            tasks=tasks,
+            error=("Codex не передал список фоновых процессов: " + "; ".join(dict.fromkeys(errors)))
+            if errors
+            else "",
+        )
+
     async def publish_selection(self, rid: str | None = None) -> None:
         bridge = self.sessions.get(self.selected)
         thread = self.catalog.get(self.selected, {})
@@ -363,6 +424,7 @@ class ProjectController:
             state=bridge.state if bridge else "ready",
             background_sessions=self.background_count,
         )
+        await self.send_stats(self.selected)
 
     async def select(self, thread_id: str, *, archived: bool = False, rid: str | None = None) -> None:
         if thread_id == "new":
@@ -455,7 +517,7 @@ class ProjectController:
                 await self.send_sessions()
             elif kind == "sessions.list":
                 await self.send_sessions(archived=frame.get("archived") is True, cursor=frame.get("cursor"))
-            elif kind in {"session.select", "session.close"}:
+            elif kind in {"session.select", "session.close", "session.rename"}:
                 async with self.lock:
                     if frame.get("expected_session") != self.selected:
                         raise ValueError("Выбранная сессия изменилась; обновите список и повторите действие")
@@ -466,8 +528,37 @@ class ProjectController:
                         await self.select(
                             target, archived=frame.get("archived") is True, rid=frame.get("rid")
                         )
+                    elif kind == "session.rename":
+                        name = frame.get("title")
+                        if (
+                            not isinstance(name, str)
+                            or not 1 <= len(name.strip()) <= 100
+                            or any(ord(ch) < 32 for ch in name)
+                        ):
+                            raise ValueError("Название сессии должно содержать от 1 до 100 символов")
+                        await self.app.rename_thread(target, self.project, name.strip())
+                        self.catalog.setdefault(target, {})["name"] = name.strip()
+                        await self.send(
+                            "session.renamed", session=target, title=name.strip(), rid=frame.get("rid")
+                        )
+                        await self.send_sessions(archived=frame.get("archived") is True)
                     else:
                         await self.close_session(target, frame.get("rid"))
+            elif kind == "background.get":
+                await self.send_background()
+            elif kind == "background.stop":
+                target = frame.get("session")
+                if target not in self.sessions:
+                    raise ValueError("Этот разговор не подключён к проекту")
+                terminated = await self.app.terminate_background(
+                    target, self.project, str(frame.get("task_id") or "")
+                )
+                if not terminated:
+                    raise ValueError("Codex не подтвердил остановку фонового процесса")
+                task = self.backgrounds.get(target + ":" + str(frame.get("task_id") or ""))
+                if task:
+                    task.update(status="stopped", finished_at=time.time())
+                await self.send_background()
             elif kind in {"model.get", "model.set"}:
                 async with self.lock:
                     await self.model_command(frame)
@@ -618,6 +709,22 @@ class ProjectController:
                 # остальные политики не меняются.
                 self.template.update(model=thread.get("model"), reasoningEffort=thread.get("reasoningEffort"))
             await self.send_model_settings(thread_id, thread=thread)
+            bridge.token_usage = {}
+            await self.send_stats(thread_id)
+        elif method == "thread/tokenUsage/updated":
+            usage = params.get("tokenUsage", {})
+            last = usage.get("last", {})
+            used, maximum = last.get("totalTokens"), usage.get("modelContextWindow")
+            if type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
+                thread = self.catalog.get(thread_id, {})
+                bridge.token_usage = {"used": used, "max": maximum, "model": thread.get("model", "")}
+                await self.send_stats(thread_id)
+        elif method == "thread/name/updated":
+            name = params.get("threadName")
+            self.catalog.setdefault(thread_id, {})["name"] = name
+            await self.send(
+                "session.renamed", session=thread_id, title=session_title(self.catalog[thread_id])
+            )
         elif method in {"thread/closed", "thread/archived"}:
             # Закрытие одного разговора не закрывает канал и другие разговоры проекта.
             bridge.state = "offline"

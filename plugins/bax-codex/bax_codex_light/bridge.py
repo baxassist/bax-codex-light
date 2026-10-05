@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from . import __version__, files, images
+from . import __version__, attachments, files, images
 from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
@@ -21,6 +21,7 @@ from .registry import Registration, Registry
 
 log = logging.getLogger(__name__)
 SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read", "power.get", "power.set"]
+SUPPORTS.append("attachments")
 
 
 @dataclass
@@ -31,6 +32,7 @@ class Submission:
     steer_allowed: bool = True
     images: list[dict] = field(default_factory=list)
     image_count: int = 0
+    accepted_text: str | None = None
 
     @property
     def preview(self) -> str:
@@ -304,6 +306,11 @@ class Bridge:
                         "id": self.history.preview_id(client_id),
                         "kind": "user",
                         "text": submission.preview,
+                        **(
+                            {"accepted_text": submission.accepted_text}
+                            if submission.accepted_text is not None
+                            else {}
+                        ),
                     }
                 )
                 if submission.error:
@@ -380,15 +387,29 @@ class Bridge:
             if not self.history or not self.app or self.app.closed.is_set():
                 raise RPCError("Сессия Codex недоступна")
             raw = frame.get("attachments")
-            picture_inputs = [] if raw is None or raw == [] else await asyncio.to_thread(images.inputs, raw)
+            picture_inputs, document_text = await asyncio.to_thread(attachments.prepare, self.project, raw)
+            text += document_text
             if not text.strip() and not picture_inputs:
                 raise ValueError("Нужен текст задачи или картинка")
             client_id = str(uuid4())
             self.queue.append((client_id, text))
-            submission = Submission(text, images=picture_inputs, image_count=len(picture_inputs))
+            submission = Submission(
+                text,
+                images=picture_inputs,
+                image_count=len(picture_inputs),
+                accepted_text=frame["text"] if document_text else None,
+            )
             self.outbox[client_id] = submission
             await self.send(
-                "message", id=self.history.preview_id(client_id), kind="user", text=submission.preview
+                "message",
+                id=self.history.preview_id(client_id),
+                kind="user",
+                text=submission.preview,
+                **(
+                    {"accepted_text": submission.accepted_text}
+                    if submission.accepted_text is not None
+                    else {}
+                ),
             )
 
     def start_options(self) -> dict:

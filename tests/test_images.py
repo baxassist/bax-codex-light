@@ -151,7 +151,7 @@ async def test_rejected_steer_retains_image_until_retry_is_accepted(tmp_path):
     [
         [dict(PHOTO, data="not-base64!")],
         [dict(PHOTO, data=base64.b64encode(b"plain text").decode())],
-        [dict(PHOTO, mime="text/plain")],
+        [dict(PHOTO, mime="not-a-mime")],
         [dict(PHOTO, mime=[])],
         [dict(PHOTO, data="A" * (images.MAX_IMAGE_BYTES * 2))],
         [PHOTO] * 9,

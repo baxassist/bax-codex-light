@@ -21,6 +21,8 @@ class ProjectApp(FakeApp):
         self.threads["foreign"] = thread(project.parent, thread_id="foreign")
         self.archived = set()
         self.created = 0
+        self.terminals = {"a": [], "b": []}
+        self.terminated = True
         self.unmaterialized = set()
         self.empty = set()
         self.name_error = False
@@ -130,6 +132,14 @@ class ProjectApp(FakeApp):
                     self.unmaterialized.discard(tid)
                     self.threads[tid]["name"] = params["name"]
                     result = {}
+                elif method == "thread/backgroundTerminals/list":
+                    result = {"data": self.terminals.get(tid, []), "nextCursor": None}
+                elif method == "thread/backgroundTerminals/terminate":
+                    if self.terminated:
+                        self.terminals[tid] = [
+                            item for item in self.terminals[tid] if item["processId"] != params["processId"]
+                        ]
+                    result = {"terminated": self.terminated}
                 elif method == "thread/archive":
                     self.archived.add(tid)
                     self.threads[tid]["status"] = {"type": "notLoaded"}

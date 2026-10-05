@@ -39,6 +39,7 @@ class ResponseMetadata:
         self.by_id: dict[str, dict] = {}
         self.by_fingerprint: dict[tuple, list[dict]] = defaultdict(list)
         self.turns: dict[str, dict] = {}
+        self.token_usage: dict = {}
 
     def refresh(self) -> None:
         if not self.path:
@@ -54,6 +55,7 @@ class ResponseMetadata:
                 self.by_id.clear()
                 self.by_fingerprint.clear()
                 self.turns.clear()
+                self.token_usage = {}
             file.seek(self.offset)
             while line := file.readline(16 * 1024 * 1024):
                 if not line.endswith(b"\n"):
@@ -88,6 +90,12 @@ class ResponseMetadata:
                 self.turns[turn] = dict(self.context)
             else:
                 self.context = {}
+        elif kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info") or {}
+            last = info.get("last_token_usage") or {}
+            used, maximum = last.get("total_tokens"), info.get("model_context_window")
+            if type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
+                self.token_usage = {"used": used, "max": maximum, "model": self.context.get("model", "")}
         elif (
             kind == "response_item"
             and payload.get("type") == "message"

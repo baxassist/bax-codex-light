@@ -16,7 +16,7 @@ from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from pydantic import Field
 from websockets.asyncio.client import connect, unix_connect
 
-from . import __version__
+from . import __version__, background
 from .response_metadata import ResponseMetadata
 
 EventHandler = Callable[[dict], Awaitable[None]]
@@ -312,6 +312,51 @@ class AppServer:
             schemas.ThreadArchiveResponse,
             {"threadId": thread_id},
         )
+
+    async def rename_thread(self, thread_id: str, project: Path, name: str) -> None:
+        await self.read_thread(thread_id, project)
+        await self.typed(
+            "thread/name/set",
+            schemas.ThreadSetNameParams,
+            schemas.ThreadSetNameResponse,
+            {"threadId": thread_id, "name": name},
+        )
+        self.threads[thread_id]["name"] = name
+
+    async def context_usage(self, thread_id: str) -> dict:
+        await self.response_metadata(thread_id, [])
+        value = self.metadata.get(thread_id)
+        return dict(value.token_usage) if value else {}
+
+    async def background_terminals(self, thread_id: str, project: Path) -> list[dict]:
+        thread = await self.read_thread(thread_id, project)
+        if thread["status"]["type"] == "notLoaded":
+            return []
+        items, cursor = [], None
+        for _ in range(20):
+            page = await self.typed(
+                "thread/backgroundTerminals/list",
+                background.ListParams,
+                background.ListResponse,
+                {"threadId": thread_id, "limit": 100, "cursor": cursor},
+            )
+            items.extend(page["data"])
+            cursor = page.get("nextCursor")
+            if not cursor:
+                return items
+        raise RPCError("Список фоновых процессов слишком большой")
+
+    async def terminate_background(self, thread_id: str, project: Path, process_id: str) -> bool:
+        tasks = await self.background_terminals(thread_id, project)
+        if not any(item["processId"] == process_id for item in tasks):
+            raise ValueError("Этот фоновый процесс уже завершился")
+        result = await self.typed(
+            "thread/backgroundTerminals/terminate",
+            background.TerminateParams,
+            background.TerminateResponse,
+            {"threadId": thread_id, "processId": process_id},
+        )
+        return result["terminated"]
 
     async def unarchive_thread(self, thread_id: str, project: Path) -> dict:
         await self.read_thread(thread_id, project)
