@@ -181,3 +181,22 @@ timeout, delivery, unknown. Основной источник — официал
 check_limits, wait, open_codex, edit_request, check_history, reload_history, none.
 Для `model.settings` совместимый `error` дополнен `error_details` той же схемы.
 Старые клиенты читают безопасную строку, новые — причину и диагностические поля.
+
+## Статус сессии (0.5.6)
+
+Capability `session.status.get`: телефон отправляет `session`, `rid`. Плагин
+проверяет выбранный разговор и cwd через thread/read и возвращает `session.details`
+с теми же session/rid. Модель/провайдер берутся из thread, остальные эффективные
+параметры — из подтверждённого ответа thread/resume этой сессии. Неизвестные
+значения остаются null. `instructions` — только пути источников, без содержимого.
+`account` содержит тип/тариф без email, accountId и токенов.
+`limits` — список всех primary/secondary окон из rateLimitsByLimitId с id/name,
+used_pct, minutes и resets_at; резервные окна не теряются.
+
+account/read и account/rateLimits/read проверяются типами официального SDK.
+Параметры refreshToken/supportsLunaReserve не включаются: запрос не обновляет вход
+и не включает эксперимент резервного тарифа. При недоступности аккаунта/лимитов
+возвращается частичный снимок и список unavailable.
+Телефон отбрасывает чужие и устаревшие ответы по agent/session/rid. Старый плагин
+не получает неизвестной команды; экран показывает известный контекст и соединение.
+[Официальный контракт Codex App Server](https://learn.chatgpt.com/docs/app-server).

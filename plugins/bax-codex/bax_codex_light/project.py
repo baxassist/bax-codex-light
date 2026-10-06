@@ -12,7 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import __version__, files
+from . import __version__, files, session_status
 from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError, RPCRejected
 from .bridge import SUPPORTS, Bridge, Submission
 from .connection import Relay, network_error
@@ -35,6 +35,7 @@ PROJECT_SUPPORTS = [
     "model.set",
     "session.compact",
     "context.get",
+    "session.status.get",
 ]
 CONFIG_FIELDS = (
     "model",
@@ -621,6 +622,13 @@ class ProjectController:
                 if task:
                     task.update(status="stopped", finished_at=time.time())
                 await self.send_background()
+            elif kind == "session.status.get":
+                target = frame.get("session")
+                if not target or target != self.selected or target not in self.sessions:
+                    raise ValueError("Выбранная сессия изменилась; откройте статус заново")
+                details = await session_status.snapshot(self, target)
+                await self.send_stats(target)
+                await self.send("session.details", session=target, rid=frame.get("rid"), **details)
             elif kind in {"model.get", "model.set"}:
                 async with self.lock:
                     await self.model_command(frame)
