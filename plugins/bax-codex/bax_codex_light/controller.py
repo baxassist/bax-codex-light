@@ -265,6 +265,9 @@ class ProjectClient:
                     self.thread_id = thread_id
                 finally:
                     await app.close()
+                # MCP мог стартовать без CODEX_THREAD_ID. После проверки точного
+                # ID запускаем discovery, не выбирая разговор заново.
+                await self.start()
         if self.project:
             try:
                 result = await request(
@@ -277,6 +280,11 @@ class ProjectClient:
                 return result
             except (OSError, TimeoutError, RPCError) as error:
                 self.error = str(error)
+                # Контроллер мог завершиться уже после успешного discovery.
+                # Возобновляем восстановление, сохраняя его выбранную сессию.
+                if self.task is None or self.task.done():
+                    self.task = None
+                    await self.start()
         return {
             "plugin_version": __version__,
             "project": str(self.project) if self.project else None,

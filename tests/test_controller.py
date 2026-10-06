@@ -65,6 +65,7 @@ async def test_missing_mcp_context_can_identify_caller_without_selecting_it(tmp_
             assert (await first.status())["thread_id"] == "a"
             assert not any(c["method"] == "thread/start" for c in fake.calls)
         finally:
+            await observer.close()
             await first.close()
             await request(directory, "shutdown")
 
@@ -122,3 +123,54 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
             await client.close()
             await original_request(directory, "shutdown")
             await until(lambda: not fake.connections)
+
+
+async def test_late_exact_caller_starts_controller_and_preserves_saved_selection(tmp_path):
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        first = ProjectClient(tmp_path, registry, "a", endpoint)
+        directory = await first.ensure_controller()
+        await first.bind("a")
+        await request(directory, "shutdown")
+        await until(lambda: not (directory / "control.sock").exists())
+        observer = ProjectClient(None, registry, endpoint=endpoint)
+        await observer.start()
+        assert observer.task is None  # Как MCP, запущенный Codex без ID в окружении.
+        try:
+            await observer.status("b")
+            assert observer.task is not None
+            await asyncio.wait_for(asyncio.shield(observer.task), 8)
+            result = await observer.status()
+            assert result["caller_thread_id"] == "b"
+            assert result["thread_id"] == "a"
+            assert not any(call["method"] == "thread/start" for call in fake.calls)
+            with pytest.raises(ValueError, match="другому разговору"):
+                await observer.status("a")
+        finally:
+            await first.close()
+            await observer.close()
+            await request(directory, "shutdown")
+
+
+async def test_status_recovers_controller_lost_after_completed_start(tmp_path):
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        client = ProjectClient(tmp_path, registry, "a", endpoint)
+        await client.start()
+        await asyncio.wait_for(asyncio.shield(client.task), 8)
+        directory = runtime_path(tmp_path, registry, endpoint)
+        await client.bind("a")
+        await request(directory, "shutdown")
+        await until(lambda: not (directory / "control.sock").exists())
+        old_task = client.task
+        try:
+            await client.status()
+            assert client.task is not old_task
+            await asyncio.wait_for(asyncio.shield(client.task), 8)
+            assert (await client.status())["thread_id"] == "a"
+            assert not any(call["method"] == "thread/start" for call in fake.calls)
+        finally:
+            await client.close()
+            await request(directory, "shutdown")
