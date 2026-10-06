@@ -244,9 +244,18 @@ class AppServer:
             },
         )
 
-    async def new_thread(self, project: Path, template: dict) -> dict:
+    async def new_thread(self, project: Path, template: dict, feed_prompt: str = "") -> dict:
         config = {}
         params = {"cwd": str(project), "serviceName": "bax_codex_light", "historyMode": "legacy"}
+        if feed_prompt.strip():
+            params["developerInstructions"] = (
+                "Пользовательские правила публикации в Поток Бакса:\n"
+                + feed_prompt.strip()
+                + "\nДля публикации используй bax_publish(text, publication_key). "
+                "Ключ результата постоянен, например ios-0.77.8-205 или plugin-0.5.9. "
+                "Успех подтверждён только при published=true. При stream_disabled не публикуй "
+                "и не меняй переключатель. Тайм-аут повторяй с тем же ключом."
+            )
         if template:
             for field in ("model", "modelProvider", "approvalPolicy", "approvalsReviewer", "serviceTier"):
                 if template.get(field) is not None:

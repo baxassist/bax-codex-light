@@ -11,6 +11,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from . import __version__, files, session_status
 from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError, RPCRejected
@@ -117,6 +118,7 @@ class ProjectController:
         self.error = self.error_code = ""
         self.catalog: dict[str, dict] = {}
         self.backgrounds: dict[str, dict] = {}
+        self.publications: dict[str, asyncio.Future] = {}
         self.preferences = Preferences(registry.path.with_name(f"{registry.path.stem}-settings.json"))
         self.load()
 
@@ -449,14 +451,16 @@ class ProjectController:
         )
         await self.send_stats(self.selected)
 
-    async def select(self, thread_id: str, *, archived: bool = False, rid: str | None = None) -> None:
+    async def select(
+        self, thread_id: str, *, archived: bool = False, rid: str | None = None, feed_prompt: str = ""
+    ) -> None:
         if thread_id == "new":
             if self.selected:
                 await self.ensure_session(self.selected)
                 self.template = {
                     k: v for k, v in self.app.configurations[self.selected].items() if k in CONFIG_FIELDS
                 }
-            thread = await self.app.new_thread(self.project, self.template)
+            thread = await self.app.new_thread(self.project, self.template, feed_prompt)
             thread_id = thread["id"]
         bridge = await self.ensure_session(thread_id, archived=archived)
         self.selected = thread_id
@@ -528,7 +532,11 @@ class ProjectController:
     async def on_frame(self, frame: dict) -> None:
         try:
             kind = frame.get("type")
-            if kind == "subscribe":
+            if kind == "feed.published":
+                pending = self.publications.get(frame.get("rid"))
+                if pending and not pending.done():
+                    pending.set_result({k: v for k, v in frame.items() if k not in {"v", "type", "rid"}})
+            elif kind == "subscribe":
                 await self.on_ready()
                 bridge = self.sessions.get(self.selected)
                 if bridge:
@@ -549,7 +557,10 @@ class ProjectController:
                         raise ValueError("Нужен точный ID сессии")
                     if kind == "session.select":
                         await self.select(
-                            target, archived=frame.get("archived") is True, rid=frame.get("rid")
+                            target,
+                            archived=frame.get("archived") is True,
+                            rid=frame.get("rid"),
+                            feed_prompt=frame.get("feed_prompt", ""),
                         )
                     elif kind == "session.rename":
                         name = frame.get("title")
@@ -789,6 +800,29 @@ class ProjectController:
         self.save()
         await self.publish_selection(rid)
         await self.send_sessions()
+
+    async def publish_to_feed(self, thread_id: str, text: str, publication_key: str) -> dict:
+        if not self.app or not self.relay or not self.relay.connected:
+            raise ValueError("Бакс не подключён")
+        await self.app.inspect(thread_id, self.project)
+        if not text.strip() or len(text) > 10000 or not publication_key.strip() or len(publication_key) > 128:
+            raise ValueError("Нужен текст до 10000 символов и постоянный ключ результата до 128 символов")
+        rid = str(uuid4())
+        pending = asyncio.get_running_loop().create_future()
+        self.publications[rid] = pending
+        try:
+            if not await self.send("feed.publish", rid=rid, text=text, publication_key=publication_key):
+                raise ValueError("Нет связи с Потоком; публикация не подтверждена")
+            try:
+                return await asyncio.wait_for(pending, 20)
+            except TimeoutError:
+                return {
+                    "published": None,
+                    "reason": "confirmation_timeout",
+                    "publication_key": publication_key,
+                }
+        finally:
+            self.publications.pop(rid, None)
 
     async def resolve_question(self, thread_id: str, question_id: str) -> dict:
         bridge = self.sessions.get(thread_id)

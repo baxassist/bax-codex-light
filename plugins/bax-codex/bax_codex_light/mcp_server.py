@@ -65,6 +65,20 @@ def create_server(bridge: Bridge) -> MCPServer:
         return await bridge.bind(thread_id)
 
     @server.tool(annotations=types.ToolAnnotations(destructiveHint=False, openWorldHint=True))
+    async def bax_publish(text: str, publication_key: str, thread_id: str = "") -> dict[str, Any]:
+        """Опубликовать значимый результат в Поток Бакса по поручению пользователя.
+
+        Напишите конкретные детали выпуска/результата, а не статус «задача завершена».
+        publication_key — постоянное имя результата (например ios-0.77.8-205):
+        повтор с тем же ключом не создаёт дубль. Используйте тот же ключ после тайм-аута.
+        Выключено «Уведомлять в Поток» — published=false, событие не сохраняется.
+        Публикация успешна только при published=true; null означает нет подтверждения.
+        """
+        if not hasattr(bridge, "publish_to_feed"):
+            return {"published": False, "reason": "project_mode_required"}
+        return await bridge.publish_to_feed(text, publication_key, thread_id)
+
+    @server.tool(annotations=types.ToolAnnotations(destructiveHint=False, openWorldHint=True))
     async def bax_connect(key: str, server: str = "wss://relay.baxassist.com/agent") -> dict[str, Any]:
         """Подключить текущий проект по строке регистрации, которую человек скопировал из Бакса."""
         return await bridge.connect(key, server)

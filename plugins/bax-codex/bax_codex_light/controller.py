@@ -81,6 +81,10 @@ async def serve_controller(project: Path, registry: Registry, endpoint: str | No
                         result = controller.status(params.get("thread_id", ""))
                     elif method == "resolve_question":
                         result = await controller.resolve_question(params["thread_id"], params["question_id"])
+                    elif method == "publish_to_feed":
+                        result = await controller.publish_to_feed(
+                            params["thread_id"], params["text"], params["publication_key"]
+                        )
                     elif method == "attach":
                         result = await controller.attach(params["thread_id"])
                     elif method == "connect":
@@ -298,6 +302,18 @@ class ProjectClient:
             "error": self.error,
             "error_code": self.error_code,
         }
+
+    async def publish_to_feed(self, text: str, publication_key: str, thread_id: str = "") -> dict:
+        await self.status(thread_id)
+        if not self.project or not self.thread_id:
+            raise ValueError("Нужен точный CODEX_THREAD_ID текущего разговора")
+        return await request(
+            runtime_path(self.project, self.registry, self.endpoint),
+            "publish_to_feed",
+            thread_id=self.thread_id,
+            text=text,
+            publication_key=publication_key,
+        )
 
     async def resolve_question(self, question_id: str, thread_id: str = "") -> dict:
         await self.status(thread_id)

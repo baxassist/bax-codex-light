@@ -228,6 +228,7 @@ async def test_official_mcp_stdio_client_and_clean_eof(tmp_path):
             "bax_attach",
             "bax_connect",
             "bax_resolve_question",
+            "bax_publish",
         }
         response = await session.call_tool("bax_status", {})
         assert not response.is_error

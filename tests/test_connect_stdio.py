@@ -41,7 +41,20 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
         connected.set()
         await ws.send(json.dumps({"v": 1, "type": "subscribe"}))
         async for payload in ws:
-            messages.append(json.loads(payload))
+            message = json.loads(payload)
+            messages.append(message)
+            if message.get("type") == "feed.publish":
+                await ws.send(
+                    json.dumps(
+                        {
+                            "v": 1,
+                            "type": "feed.published",
+                            "rid": message["rid"],
+                            "published": True,
+                            "event_id": "published-event",
+                        }
+                    )
+                )
 
     async with fake.running() as endpoint, serve(relay, "127.0.0.1", 0) as relay_server:
         relay_url = f"ws://127.0.0.1:{relay_server.sockets[0].getsockname()[1]}/agent"
@@ -67,6 +80,20 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             assert secret not in result.model_dump_json()
             await asyncio.wait_for(connected.wait(), 5)
             await until(lambda: any(m.get("text") == "Последний ответ" for m in messages), timeout=5)
+            publication = await session.call_tool(
+                "bax_publish",
+                {
+                    "text": "Плагин 0.5.9 опубликован: добавлена явная запись результата в Поток",
+                    "publication_key": "plugin-0.5.9",
+                    "thread_id": "current",
+                },
+            )
+            assert not publication.is_error
+            assert publication.structured_content["published"] is True
+            assert publication.structured_content["event_id"] == "published-event"
+            assert (
+                next(m for m in messages if m["type"] == "feed.publish")["publication_key"] == "plugin-0.5.9"
+            )
             stored = Registry(tmp_path / "registry.json").get(project)
             assert stored.agent == agent
             assert stored.secret == secret

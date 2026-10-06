@@ -49,6 +49,7 @@ async def test_mcp_tools_available_when_exact_thread_socket_is_missing(tmp_path)
             "bax_attach",
             "bax_connect",
             "bax_resolve_question",
+            "bax_publish",
         }
         for _ in range(30):
             result = await session.call_tool("bax_status", {})
