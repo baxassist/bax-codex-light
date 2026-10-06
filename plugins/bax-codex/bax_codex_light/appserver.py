@@ -476,6 +476,28 @@ class AppServer:
         turn = await self.last_turn_failure(thread_id)
         return (turn.get("error") or {}).get("message", "")
 
+    async def installed_skills(self, project: Path) -> list[dict]:
+        result = await self.typed(
+            "skills/list",
+            schemas.SkillsListParams,
+            schemas.SkillsListResponse,
+            {"cwds": [str(project)], "forceReload": True},
+        )
+        skills = {}
+        for entry in result["data"]:
+            if entry["cwd"] != str(project):
+                continue
+            if entry.get("errors"):
+                raise RPCError("Codex не смог прочитать часть скиллов; проверьте их установку")
+            for skill in entry["skills"]:
+                if skill["enabled"]:
+                    interface = skill.get("interface") or {}
+                    skills[skill["name"]] = {
+                        "name": skill["name"],
+                        "description": interface.get("shortDescription") or skill["description"],
+                    }
+        return sorted(skills.values(), key=lambda skill: skill["name"].casefold())
+
     async def model_catalog(self) -> list[dict]:
         items, cursor = [], None
         for _ in range(20):

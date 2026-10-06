@@ -42,6 +42,8 @@ class ProjectApp(FakeApp):
                 "excludeTmpdirEnvVar": True,
             },
         }
+        self.skills = []
+        self.skill_errors = []
         self.mismatch_model = False
         for value in self.threads.values():
             value.update(model="chosen-model", reasoningEffort="high")
@@ -91,6 +93,12 @@ class ProjectApp(FakeApp):
                     result = {"userAgent": "fake/0.160.0"}
                 elif method == "thread/read":
                     result = {"thread": self.threads[tid]}
+                elif method == "skills/list":
+                    result = {
+                        "data": [
+                            {"cwd": str(self.project), "skills": self.skills, "errors": self.skill_errors}
+                        ]
+                    }
                 elif method == "model/list":
                     result = {"data": self.models, "nextCursor": None}
                 elif method == "thread/resume":

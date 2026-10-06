@@ -31,6 +31,7 @@ PROJECT_SUPPORTS = [
     "background.get",
     "background.stop",
     "cancel",
+    "skills.list",
     "model.get",
     "model.set",
     "session.compact",
@@ -629,6 +630,12 @@ class ProjectController:
                 details = await session_status.snapshot(self, target)
                 await self.send_stats(target)
                 await self.send("session.details", session=target, rid=frame.get("rid"), **details)
+            elif kind == "skills.list":
+                try:
+                    skills = await self.app.installed_skills(self.project)
+                    await self.send("skills", rid=frame.get("rid"), skills=skills)
+                except (ValueError, RPCError, TimeoutError, OSError) as error:
+                    await self.send("skills", rid=frame.get("rid"), skills=[], error=safe_message(error))
             elif kind in {"model.get", "model.set"}:
                 async with self.lock:
                     await self.model_command(frame)
