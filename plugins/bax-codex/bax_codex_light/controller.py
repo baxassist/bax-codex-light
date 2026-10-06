@@ -22,6 +22,10 @@ from .project import ProjectController
 from .registry import Registry
 
 
+class ControllerUpdatePending(RPCError):
+    """Старый контроллер сохраняет связь до безопасного промежутка между ходами."""
+
+
 def runtime_path(project: Path, registry: Registry, endpoint: str | None) -> Path:
     key = f"{project.resolve()}\n{registry.path.resolve()}"
     digest = hashlib.sha256(key.encode()).hexdigest()[:24]
@@ -140,6 +144,11 @@ class ProjectClient:
             await self.discover()
             if not self.error:
                 return
+            if self.error_code == "controller_update_pending":
+                # Это не сетевой сбой: 30-секундная задержка пропускает короткий
+                # промежуток между задачами. Сам владелец проверяет безопасность остановки.
+                await asyncio.sleep(0.25)
+                continue
             await asyncio.sleep(min(2**attempt, 30))
             attempt = min(attempt + 1, 5)
 
@@ -155,7 +164,9 @@ class ProjectClient:
         except (RPCError, OSError, TimeoutError, ValueError) as error:
             self.error = str(error)
             self.error_code = "controller_unavailable"
-            if isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
+            if isinstance(error, ControllerUpdatePending):
+                self.error_code = "controller_update_pending"
+            elif isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
                 self.error_code = "codex_unavailable"
                 self.error = (
                     f"Локальный сервер Codex недоступен: {app.endpoint}. "
@@ -189,7 +200,12 @@ class ProjectClient:
                 return directory  # Старое окно MCP не понижает уже обновлённый контроллер.
             # Владелец сам проверяет фоновые ходы, доставки и вопросы перед остановкой.
             # Если он занят, auto_discover повторит попытку; связь остаётся у прежнего владельца.
-            await request(directory, "shutdown")
+            try:
+                await request(directory, "shutdown")
+            except RPCError as error:
+                if "Контроллер занят" in str(error):
+                    raise ControllerUpdatePending(str(error)) from error
+                raise
             for _ in range(100):
                 if not (directory / "control.sock").exists():
                     break

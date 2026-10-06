@@ -83,11 +83,14 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
             fake.threads["a"]["status"] = {"type": "active", "activeFlags": []}
         await client.bind("a")
         original_request = controller.request
+        stopped = asyncio.Event()
 
         async def older(directory, method, **params):
             result = await original_request(directory, method, **params)
             if method == "status" and result["controller_pid"] == old_pid:
                 result["plugin_version"] = "0.4.0"
+            if method == "shutdown":
+                stopped.set()
             return result
 
         monkeypatch.setattr(controller, "request", older)
@@ -96,8 +99,20 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
                 with pytest.raises(RPCError, match="занят"):
                     await client.ensure_controller()
                 assert (await original_request(directory, "status"))["controller_pid"] == old_pid
+                await client.start()
+                await until(lambda: client.error_code == "controller_update_pending")
+                # Несколько занятых проверок не должны разгонять сетевой backoff:
+                # между задачами может быть меньше секунды.
+                await asyncio.sleep(1.1)
+                assert (await original_request(directory, "status"))["controller_pid"] == old_pid
+                fake.threads["a"]["status"] = {"type": "idle"}
                 await fake.emit("thread/status/changed", {"threadId": "a", "status": {"type": "idle"}})
-                await asyncio.sleep(0.1)
+                await asyncio.wait_for(stopped.wait(), 0.8)
+                await asyncio.wait_for(asyncio.shield(client.task), 8)
+                current = await original_request(directory, "status")
+                assert current["controller_pid"] != old_pid
+                assert current["thread_id"] == "a"
+                assert not client.error
             else:
                 await client.ensure_controller()
                 current = await original_request(directory, "status")
