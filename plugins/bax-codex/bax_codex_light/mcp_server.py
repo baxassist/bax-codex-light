@@ -8,6 +8,7 @@ from typing import Any
 
 from mcp import types
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .bridge import Bridge
@@ -71,12 +72,18 @@ def create_server(bridge: Bridge) -> MCPServer:
         Напишите конкретные детали выпуска/результата, а не статус «задача завершена».
         publication_key — постоянное имя результата (например ios-0.77.8-205):
         повтор с тем же ключом не создаёт дубль. Используйте тот же ключ после тайм-аута.
-        Выключено «Уведомлять в Поток» — published=false, событие не сохраняется.
+        Выключено «Уведомлять в Поток» — ошибка stream_disabled, событие не сохраняется.
         Публикация успешна только при published=true; null означает нет подтверждения.
         """
         if not hasattr(bridge, "publish_to_feed"):
-            return {"published": False, "reason": "project_mode_required"}
-        return await bridge.publish_to_feed(text, publication_key, thread_id)
+            raise ToolError("project_mode_required: публикация доступна в режиме проекта")
+        result = await bridge.publish_to_feed(text, publication_key, thread_id)
+        if result.get("published") is False:
+            code = result.get("reason", "publication_rejected")
+            if code == "stream_disabled":
+                raise ToolError("stream_disabled: публикация в Поток запрещена, уведомления агента выключены")
+            raise ToolError(f"{code}: сервер отклонил публикацию в Поток")
+        return result
 
     @server.tool(annotations=types.ToolAnnotations(destructiveHint=False, openWorldHint=True))
     async def bax_connect(key: str, server: str = "wss://relay.baxassist.com/agent") -> dict[str, Any]:

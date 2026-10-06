@@ -44,17 +44,14 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             message = json.loads(payload)
             messages.append(message)
             if message.get("type") == "feed.publish":
-                await ws.send(
-                    json.dumps(
-                        {
-                            "v": 1,
-                            "type": "feed.published",
-                            "rid": message["rid"],
-                            "published": True,
-                            "event_id": "published-event",
-                        }
-                    )
-                )
+                result = {"published": True, "event_id": "published-event"}
+                if message["publication_key"] == "disabled":
+                    result = {
+                        "published": False,
+                        "reason": "stream_disabled",
+                        "error": {"code": "stream_disabled", "message": "Уведомления выключены"},
+                    }
+                await ws.send(json.dumps({"v": 1, "type": "feed.published", "rid": message["rid"], **result}))
 
     async with fake.running() as endpoint, serve(relay, "127.0.0.1", 0) as relay_server:
         relay_url = f"ws://127.0.0.1:{relay_server.sockets[0].getsockname()[1]}/agent"
@@ -94,6 +91,15 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             assert (
                 next(m for m in messages if m["type"] == "feed.publish")["publication_key"] == "plugin-0.5.9"
             )
+            rejected = await session.call_tool(
+                "bax_publish",
+                {"text": "Запрещённая публикация", "publication_key": "disabled", "thread_id": "current"},
+            )
+            assert rejected.is_error
+            assert "stream_disabled" in rejected.model_dump_json()
+            # Отказ не закрывает канал и не мешает следующей задаче.
+            still_connected = await session.call_tool("bax_status", {"thread_id": "current"})
+            assert not still_connected.is_error and still_connected.structured_content["connected"]
             stored = Registry(tmp_path / "registry.json").get(project)
             assert stored.agent == agent
             assert stored.secret == secret
