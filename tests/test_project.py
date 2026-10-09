@@ -44,6 +44,8 @@ class ProjectApp(FakeApp):
         }
         self.skills = []
         self.skill_errors = []
+        self.permission_configs = {}
+        self.requirements = None
         self.mismatch_model = False
         for value in self.threads.values():
             value.update(model="chosen-model", reasoningEffort="high")
@@ -101,11 +103,17 @@ class ProjectApp(FakeApp):
                     }
                 elif method == "model/list":
                     result = {"data": self.models, "nextCursor": None}
+                elif method == "configRequirements/read":
+                    result = {"requirements": self.requirements}
                 elif method == "thread/resume":
                     self.threads[tid]["status"] = (
                         self.threads[tid]["status"] if tid not in self.archived else {"type": "notLoaded"}
                     )
-                    result = {"thread": self.threads[tid], **self.settings}
+                    result = {
+                        "thread": self.threads[tid],
+                        **self.settings,
+                        **self.permission_configs.get(tid, {}),
+                    }
                 elif method == "thread/list":
                     result = {
                         "data": [
@@ -183,6 +191,11 @@ class ProjectApp(FakeApp):
                         )
                     }
                 elif method in {"turn/start", "turn/steer"}:
+                    if method == "turn/start" and "sandboxPolicy" in params:
+                        self.permission_configs[tid] = {
+                            "sandbox": params["sandboxPolicy"],
+                            "approvalPolicy": params["approvalPolicy"],
+                        }
                     if method == "turn/start" and "model" in params:
                         self.threads[tid].update(model=params["model"], reasoningEffort=params["effort"])
                     self.empty.discard(tid)

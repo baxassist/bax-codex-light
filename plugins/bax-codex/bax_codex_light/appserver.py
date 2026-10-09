@@ -507,6 +507,13 @@ class AppServer:
                     }
         return sorted(skills.values(), key=lambda skill: skill["name"].casefold())
 
+    async def permission_requirements(self) -> dict:
+        raw = await self.request("configRequirements/read", {})
+        result = schemas.ConfigRequirementsReadResponse.model_validate(raw).model_dump(
+            mode="json", by_alias=True, exclude_none=True, exclude_unset=True
+        )
+        return result.get("requirements") or {}
+
     async def model_catalog(self) -> list[dict]:
         items, cursor = [], None
         for _ in range(20):
@@ -545,6 +552,8 @@ class AppServer:
         images: list[dict] | None = None,
         model: str | None = None,
         effort: str | None = None,
+        approval_policy: str | None = None,
+        sandbox_policy: dict | None = None,
     ) -> dict:
         return await self.typed(
             "turn/start",
@@ -555,6 +564,11 @@ class AppServer:
                 "clientUserMessageId": client_id,
                 "input": ([{"type": "text", "text": text}] if text else []) + (images or []),
                 **({"model": model, "effort": effort} if model is not None else {}),
+                **(
+                    {"approvalPolicy": approval_policy, "sandboxPolicy": sandbox_policy}
+                    if sandbox_policy is not None
+                    else {}
+                ),
             },
         )
 

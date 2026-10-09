@@ -77,6 +77,8 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             assert secret not in result.model_dump_json()
             await asyncio.wait_for(connected.wait(), 5)
             await until(lambda: any(m.get("text") == "Последний ответ" for m in messages), timeout=5)
+            caps = next(m for m in messages if m.get("type") == "caps")
+            assert {"permissions.get", "permissions.set"} <= set(caps["supports"])
             publication = await session.call_tool(
                 "bax_publish",
                 {

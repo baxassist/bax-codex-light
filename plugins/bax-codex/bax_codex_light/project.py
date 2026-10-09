@@ -19,6 +19,7 @@ from .bridge import SUPPORTS, Bridge, Submission
 from .connection import Relay, network_error
 from .errors import failure_fields, safe_message
 from .history import History
+from .permission_settings import PRESETS, choices, mode_of, options
 from .preferences import Preferences
 from .registry import Registration, Registry
 
@@ -35,6 +36,8 @@ PROJECT_SUPPORTS = [
     "skills.list",
     "model.get",
     "model.set",
+    "permissions.get",
+    "permissions.set",
     "session.compact",
     "context.get",
     "session.status.get",
@@ -65,13 +68,26 @@ class SessionBridge(Bridge):
         self.owner = owner
         self.app = owner.app
         self.history = History(self.app, thread_id)
+        self.permission_selection: str | None = None
         self.model_selection: dict | None = None
         self.token_usage: dict = {}
 
     def start_options(self) -> dict:
-        return dict(self.model_selection or {})
+        result = dict(self.model_selection or {})
+        if self.permission_selection:
+            result.update(options(self.permission_selection))
+        return result
 
     async def model_started(self) -> None:
+        if self.permission_selection:
+            await self.app.resume_thread(self.thread_id, self.project)
+            config = self.app.configurations[self.thread_id]
+            if mode_of(config) == self.permission_selection:
+                self.permission_selection = None
+                if self.owner.selected == self.thread_id:
+                    self.owner.template = {k: v for k, v in config.items() if k in CONFIG_FIELDS}
+                self.owner.save()
+            await self.owner.send_permission_settings(self.thread_id, config=config)
         if not self.model_selection:
             return
         thread = await self.app.read_thread(self.thread_id, self.project)
@@ -142,6 +158,7 @@ class ProjectController:
         for thread_id, bridge in self.sessions.items():
             sessions[thread_id] = {
                 "model_selection": bridge.model_selection,
+                "permission_selection": bridge.permission_selection,
                 "pending": {
                     cid: {
                         "text": item.text,
@@ -307,6 +324,9 @@ class ProjectController:
         thread = await self.app.resume_thread(thread_id, self.project)
         if thread_id not in self.sessions:
             bridge = SessionBridge(self, thread_id)
+            permission = self.saved.get(thread_id, {}).get("permission_selection")
+            if isinstance(permission, str) and permission in PRESETS:
+                bridge.permission_selection = permission
             selection = self.saved.get(thread_id, {}).get("model_selection")
             if isinstance(selection, dict) and all(
                 isinstance(selection.get(k), str) and selection[k] for k in ("model", "effort")
@@ -647,6 +667,9 @@ class ProjectController:
                     await self.send("skills", rid=frame.get("rid"), skills=skills)
                 except (ValueError, RPCError, TimeoutError, OSError) as error:
                     await self.send("skills", rid=frame.get("rid"), skills=[], error=safe_message(error))
+            elif kind in {"permissions.get", "permissions.set"}:
+                async with self.lock:
+                    await self.permission_command(frame)
             elif kind in {"model.get", "model.set"}:
                 async with self.lock:
                     await self.model_command(frame)
@@ -682,12 +705,14 @@ class ProjectController:
                     await bridge.on_frame(frame)
                 self.save()
         except (ValueError, RPCError, TimeoutError, OSError) as error:
-            if frame.get("type") in {"model.get", "model.set"}:
+            if frame.get("type") in {"model.get", "model.set", "permissions.get", "permissions.set"}:
                 failure = failure_fields(
                     "session_command_failed", error, operation=str(frame.get("type")), rid=frame.get("rid")
                 )
                 await self.send(
-                    "model.settings",
+                    "permissions.settings"
+                    if str(frame.get("type")).startswith("permissions.")
+                    else "model.settings",
                     session=frame.get("session"),
                     rid=frame.get("rid"),
                     error=failure["message"],
@@ -724,6 +749,56 @@ class ProjectController:
             compacting=thread_id in self.compacting,
             error=safe_message(error) if error else None,
             **result,
+        )
+
+    async def permission_command(self, frame: dict) -> None:
+        target = frame.get("session")
+        if (
+            not isinstance(target, str)
+            or not target
+            or target != self.selected
+            or target not in self.sessions
+        ):
+            raise ValueError("Выбранный разговор изменился. Откройте разрешения снова")
+        await self.app.resume_thread(target, self.project)  # Чтение без переопределений.
+        config = self.app.configurations[target]
+        requirements = await self.app.permission_requirements()
+        available = choices(requirements)
+        if frame["type"] == "permissions.set":
+            mode = frame.get("mode")
+            if not isinstance(mode, str) or not any(
+                item["mode"] == mode and item["allowed"] for item in available
+            ):
+                raise ValueError("Этот режим недоступен по правилам Codex на компьютере")
+            if mode == "full-access" and frame.get("confirm_full_access") is not True:
+                raise ValueError("Подтвердите полный доступ к файлам и сети без запросов разрешения")
+            bridge = self.sessions[target]
+            bridge.permission_selection = None if mode == mode_of(config) else mode
+            self.save()
+        await self.send_permission_settings(target, rid=frame.get("rid"), config=config, available=available)
+
+    async def send_permission_settings(self, target: str, *, rid=None, config=None, available=None) -> None:
+        bridge = self.sessions.get(target)
+        if not bridge:
+            return
+        if config is None:
+            await self.app.resume_thread(target, self.project)
+            config = self.app.configurations[target]
+        if available is None:
+            available = choices(await self.app.permission_requirements())
+        current = mode_of(config)
+        await self.send(
+            "permissions.settings",
+            session=target,
+            rid=rid,
+            mode=bridge.permission_selection or current,
+            current_mode=current,
+            pending=bool(bridge.permission_selection),
+            approval_policy=config["approvalPolicy"],
+            reviewer=config["approvalsReviewer"],
+            sandbox=config["sandbox"],
+            profile=(config.get("activePermissionProfile") or {}).get("id"),
+            modes=available,
         )
 
     @staticmethod
