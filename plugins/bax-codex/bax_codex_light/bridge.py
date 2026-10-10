@@ -16,7 +16,7 @@ from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .errors import failure_fields, safe_message
-from .history import History, identity, render
+from .history import History, identity, render, stopped_entry
 from .preferences import Preferences
 from .registry import Registration, Registry
 
@@ -651,6 +651,19 @@ class Bridge:
             await self.send("status", state=self.state)
             await self._drain()
         elif method == "turn/completed":
+            turn = params.get("turn", {})
+            marker = stopped_entry(turn)
+            if marker and self.history:
+                stamp = marker.get("created_at")
+                await self.send(
+                    "message",
+                    id=self.history.live_id(marker["item"]["id"]),
+                    kind="event",
+                    event="stopped",
+                    text="Работа остановлена",
+                    turn_id=turn["id"],
+                    **({"created_at": stamp} if stamp else {}),
+                )
             if params.get("turn", {}).get("error"):
                 await self.send_turn_failure(params["turn"])
             else:
@@ -664,7 +677,12 @@ class Bridge:
                     for qid in request["question_ids"]:
                         self.questions.pop(qid, None)
                         await self.send("question.resolved", question_id=qid)
-            await self.send("done", id=self.history.high if self.history else 0)
+            await self.send(
+                "done",
+                id=self.history.high if self.history else 0,
+                status=turn.get("status", "completed"),
+                turn_id=turn.get("id", ""),
+            )
         elif method in {"item/started", "item/completed"} and self.history:
             item = params["item"]
             if item.get("type") == "agentMessage" and item.get("delivery") == "async":

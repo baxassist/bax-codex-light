@@ -556,7 +556,7 @@ async def test_history_uses_stored_thread_api_without_new_turn(tmp_path):
         await owner.select("a")
         fake.calls.clear()
         await owner.sessions["a"].send_history()
-        assert [c["method"] for c in fake.calls] == ["thread/items/list"]
+        assert [c["method"] for c in fake.calls] == ["thread/items/list", "thread/turns/list"]
 
 
 async def test_two_projects_have_different_controller_identities(tmp_path):

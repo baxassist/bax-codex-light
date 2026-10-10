@@ -702,6 +702,13 @@ class ProjectController:
                     turn_id = await self.app.active_turn(target)
                     if turn_id:
                         await self.app.interrupt_turn(target, turn_id)
+                    await self.send(
+                        "cancel.result",
+                        session=target,
+                        rid=frame.get("rid"),
+                        outcome="requested" if turn_id else "idle",
+                        turn_id=turn_id,
+                    )
                 else:
                     await bridge.on_frame(frame)
                 self.save()

@@ -11,8 +11,21 @@ def identity(item: dict) -> str:
     return item.get("clientId") or item["id"]
 
 
+def stopped_entry(turn: dict) -> dict | None:
+    """Служебная строка из подтверждённого исхода хода, без записи в Codex."""
+    if turn.get("status") != "interrupted" or not turn.get("id"):
+        return None
+    return {
+        "turnId": turn["id"],
+        "item": {"id": f"bax:stopped:{turn['id']}", "type": "baxTurnStopped"},
+        **({"created_at": turn["completedAt"]} if turn.get("completedAt") else {}),
+    }
+
+
 def render(item: dict) -> tuple[str, str] | None:
     kind = item.get("type")
+    if kind == "baxTurnStopped":
+        return "event", "Работа остановлена"
     if kind == "userMessage":
         content = item.get("content", [])
         text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
@@ -138,6 +151,10 @@ class History:
             }
             if row["kind"] == "assistant":
                 row.update(metadata.get((entry.get("turnId", ""), item["id"]), {}))
+            if item.get("type") == "baxTurnStopped":
+                row["event"] = "stopped"
+                if entry.get("created_at"):
+                    row["created_at"] = entry["created_at"]
             if row["kind"] in {"tool", "thinking"}:
                 if rows and rows[-1]["kind"] == "steps":
                     rows[-1].update(id=row["id"], text=row["text"], count=rows[-1]["count"] + 1)

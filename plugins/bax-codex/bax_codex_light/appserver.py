@@ -17,6 +17,7 @@ from pydantic import Field
 from websockets.asyncio.client import connect, unix_connect
 
 from . import __version__, background
+from .history import stopped_entry
 from .response_metadata import ResponseMetadata
 
 EventHandler = Callable[[dict], Awaitable[None]]
@@ -417,12 +418,13 @@ class AppServer:
     async def items(self, thread_id: str, cursor: str | None, limit: int) -> dict:
         if thread_id not in self.turn_history:
             try:
-                return await self.typed(
+                result = await self.typed(
                     "thread/items/list",
                     schemas.ThreadItemsListParams,
                     schemas.ThreadItemsListResponse,
                     {"threadId": thread_id, "cursor": cursor, "limit": limit, "sortDirection": "desc"},
                 )
+                return await self._item_turn_outcomes(thread_id, result, newest=cursor is None)
             except RPCRejected as error:
                 if str(error) != "thread/items/list is not supported yet":
                     raise
@@ -441,7 +443,7 @@ class AppServer:
                 "itemsView": "full",
             },
         )
-        return schemas.ThreadItemsListResponse.model_validate(
+        result = schemas.ThreadItemsListResponse.model_validate(
             {
                 "data": [
                     {"turnId": turn["id"], "item": item}
@@ -451,6 +453,58 @@ class AppServer:
                 "nextCursor": page.get("nextCursor"),
             }
         ).model_dump(mode="json", by_alias=True, exclude_none=True, exclude_unset=True)
+        # SDK принимает только штатные item types; служебные строки добавляем
+        # после проверки ответа. В каждой странице ход целиком, без дублей границ.
+        result["data"] = [
+            entry
+            for turn in page["data"]
+            for entry in [
+                *([stopped_entry(turn)] if stopped_entry(turn) else []),
+                *({"turnId": turn["id"], "item": item} for item in reversed(turn["items"])),
+            ]
+        ]
+        return result
+
+    async def _item_turn_outcomes(self, thread_id: str, result: dict, *, newest: bool) -> dict:
+        """Native item pages: исход добавляется только у последнего item хода.
+
+        Проверяем полные ходы, чтобы граница item-страницы не ставила остановку
+        посередине частичного ответа. Курсор истории остаётся нативным.
+        """
+        wanted = {entry["turnId"] for entry in result["data"]}
+        inserts = {}
+        empty = []
+        cursor = None
+        while wanted or (newest and cursor is None):
+            page = await self.typed(
+                "thread/turns/list",
+                schemas.ThreadTurnsListParams,
+                schemas.ThreadTurnsListResponse,
+                {
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "full",
+                },
+            )
+            for turn in page["data"]:
+                marker = stopped_entry(turn)
+                if marker and turn["items"] and turn["id"] in wanted:
+                    inserts[(turn["id"], turn["items"][-1]["id"])] = marker
+                elif marker and not turn["items"] and newest and cursor is None:
+                    empty.append(marker)
+                wanted.discard(turn["id"])
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        data = list(empty)
+        for entry in result["data"]:
+            marker = inserts.get((entry["turnId"], entry["item"]["id"]))
+            if marker:
+                data.append(marker)
+            data.append(entry)
+        return {**result, "data": data}
 
     async def active_turn(self, thread_id: str) -> str:
         result = await self.typed(
