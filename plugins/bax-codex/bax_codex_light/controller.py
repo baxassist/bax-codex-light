@@ -246,7 +246,9 @@ class ProjectClient:
                 start_new_session=True,
                 close_fds=True,
             )
-        async with asyncio.timeout(5):
+        # Холодный импорт SDK на одном ядре может занимать больше пяти секунд.
+        # Ждём готовность того же процесса, не создавая второй контроллер.
+        async with asyncio.timeout(15):
             while True:
                 try:
                     await request(directory, "status")

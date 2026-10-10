@@ -102,6 +102,7 @@ class SessionBridge(Bridge):
         self.owner.save()  # Прочитанная история могла подтвердить ранее неопределённую доставку.
 
     async def send(self, frame_type: str, **fields) -> bool:
+        await self.prepare_message(frame_type, fields)
         # Записываем ожидающее сообщение до эха приёма на телефон.
         if frame_type == "message" and fields.get("kind") == "user":
             self.owner.save()

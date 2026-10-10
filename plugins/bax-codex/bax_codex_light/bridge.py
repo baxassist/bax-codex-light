@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from . import __version__, attachments, files, images
+from . import __version__, attachments, files, images, output_images
 from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
@@ -251,8 +251,17 @@ class Bridge:
 
     async def send(self, frame_type: str, **fields) -> bool:
         if self.relay:
+            await self.prepare_message(frame_type, fields)
             return await self.relay.send(frame_type, session=self.thread_id, **fields)
         return False
+
+    async def prepare_message(self, frame_type: str, fields: dict) -> None:
+        if frame_type == "message" and fields.get("kind") == "assistant" and self.project:
+            pictures = await asyncio.to_thread(
+                output_images.collect, self.project, self.thread_id, fields.get("text", "")
+            )
+            if pictures:
+                fields["images"] = pictures
 
     async def on_ready(self) -> None:
         await self.send("caps", mode="lite", supports=SUPPORTS, remember=True)
