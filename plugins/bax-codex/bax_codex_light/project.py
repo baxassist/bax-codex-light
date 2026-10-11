@@ -396,7 +396,7 @@ class ProjectController:
         }
 
     async def on_ready(self) -> None:
-        await self.send("caps", mode="project", supports=PROJECT_SUPPORTS, remember=True)
+        await self.send("caps", mode="project", supports=PROJECT_SUPPORTS, remember=True, voice_jobs=True)
         await self.send("power.settings", **self.power_settings())
         await self.publish_selection()
 
@@ -683,6 +683,31 @@ class ProjectController:
                     self.preferences.put(self.project, reg.agent, enabled)
                     await self.relay.set_keep_awake(enabled)
                 await self.send("power.settings", **self.power_settings(), rid=frame.get("rid"))
+            elif kind == "voice.status":
+                target = frame.get("session")
+                bridge = self.sessions.get(target)
+                if not bridge:
+                    raise ValueError("Сессия задачи недоступна")
+                turn_id = frame.get("turn_id", "")
+                status = "unknown"
+                client_id = frame.get("client_id")
+                if not turn_id and client_id in bridge.outbox:
+                    pending = bridge.outbox[client_id]
+                    status = "failed" if pending.error else "queued"
+                else:
+                    if not turn_id:
+                        page = await self.app.items(target, None, 100)
+                        match = next(
+                            (item for item in page["data"] if item["item"].get("clientId") == client_id), None
+                        )
+                        turn_id = match["turnId"] if match else ""
+                    if turn_id:
+                        turns = await self.app.recent_turns(target)
+                        turn = next((item for item in turns if item["id"] == turn_id), None)
+                        status = turn["status"] if turn else "unknown"
+                await self.send(
+                    "voice.status", session=target, rid=frame.get("rid"), turn_id=turn_id, status=status
+                )
             elif kind == "files.list":
                 paths = await files.tracked(self.project)
                 await self.send(
@@ -696,7 +721,11 @@ class ProjectController:
             else:
                 target = frame.get("session")
                 bridge = self.sessions.get(target)
-                if not bridge or (kind not in {"answer", "cancel"} and target != self.selected):
+                if not bridge or (
+                    kind not in {"answer", "cancel"}
+                    and not (kind == "run" and frame.get("voice_job_id"))
+                    and target != self.selected
+                ):
                     raise ValueError("Выберите сессию; команда не отправлена в другой разговор")
                 if kind == "cancel":
                     turn_id = await self.app.active_turn(target)

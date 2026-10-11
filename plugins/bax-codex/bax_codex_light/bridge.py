@@ -9,7 +9,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from . import __version__, attachments, files, images, output_images
 from .approvals import permission_details, permission_profile, remember_approval
@@ -36,6 +36,7 @@ class Submission:
     images: list[dict] = field(default_factory=list)
     image_count: int = 0
     accepted_text: str | None = None
+    voice_job_id: str | None = None
 
     @property
     def preview(self) -> str:
@@ -480,7 +481,10 @@ class Bridge:
             text += document_text
             if not text.strip() and not picture_inputs:
                 raise ValueError("Нужен текст задачи или картинка")
-            client_id = str(uuid4())
+            voice_job_id = str(UUID(frame["voice_job_id"])) if frame.get("voice_job_id") else None
+            client_id = str(UUID(frame["client_id"])) if voice_job_id else str(uuid4())
+            if voice_job_id and client_id in self.outbox:
+                return
             self.queue.append((client_id, text))
             submission = Submission(
                 text,
@@ -488,8 +492,12 @@ class Bridge:
                 image_count=len(picture_inputs),
                 accepted_text=frame["text"] if document_text else None,
                 request_id=frame.get("rid"),
+                voice_job_id=voice_job_id,
+                steer_allowed=not bool(voice_job_id),
             )
             self.outbox[client_id] = submission
+            if voice_job_id:
+                await self.send("voice.queued", rid=voice_job_id, client_id=client_id)
             await self.send(
                 "message",
                 id=self.history.preview_id(client_id),
@@ -548,6 +556,10 @@ class Bridge:
                         # если дополнительный запрос настроек временно недоступен.
                         with contextlib.suppress(RPCError, OSError, TimeoutError):
                             await self.model_started()
+                    if submission.voice_job_id:
+                        await self.send(
+                            "voice.accepted", rid=submission.voice_job_id, turn_id=target_turn or self.turn_id
+                        )
                     # После приёма изображение хранит Codex; мост оставляет только метаданные эха.
                     submission.images = []
                     log.info("Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id)

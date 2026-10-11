@@ -599,3 +599,29 @@ async def test_subscribe_recovers_dense_history_without_changing_thread_or_permi
         assert not any(f["type"] == "error" for f in owner.relay.frames)
         assert owner.selected == "a"
         assert not any(c["method"] in {"thread/start", "turn/start", "turn/steer"} for c in fake.calls)
+
+
+async def test_server_voice_job_runs_in_original_background_session_without_selection(tmp_path):
+    from uuid import uuid4
+
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        await owner.select("b")
+        await owner.on_frame(
+            {
+                "type": "run",
+                "session": "a",
+                "text": "голосовая задача",
+                "voice_job_id": str(uuid4()),
+                "client_id": str(uuid4()),
+                "rid": str(uuid4()),
+            }
+        )
+        assert owner.selected == "b"
+        assert any(
+            call["method"] == "turn/start" and call["params"]["threadId"] == "a" for call in fake.calls
+        )
+        assert not any(call["method"] in {"thread/archive", "turn/interrupt"} for call in fake.calls)
+        assert any(
+            frame["type"] == "voice.accepted" and frame["session"] == "a" for frame in owner.relay.frames
+        )

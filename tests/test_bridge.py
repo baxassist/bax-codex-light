@@ -360,3 +360,23 @@ async def test_binding_cannot_switch_thread(tmp_path):
     b = bridge(tmp_path)
     with pytest.raises(ValueError, match="другому разговору"):
         await b.bind("other")
+
+
+async def test_voice_job_has_stable_id_and_ack_after_turn_start(tmp_path):
+    from uuid import uuid4
+
+    b = bridge(tmp_path)
+    cid, job = str(uuid4()), str(uuid4())
+    frame = {"type": "run", "text": "голосовая задача", "client_id": cid, "voice_job_id": job, "rid": job}
+    await b.on_frame(frame)
+    await b.on_frame(frame)
+    assert len(b.queue) == 1
+    assert not any(item["type"] == "voice.accepted" for item in b.relay.sent)
+    assert b.outbox[cid].steer_allowed is False
+    b.app.state = "idle"
+    await b._drain()
+    assert b.app.calls == [("current", "голосовая задача")]
+    ack = next(item for item in b.relay.sent if item["type"] == "voice.accepted")
+    assert ack["rid"] == job and ack["turn_id"] == "turn"
+    await b.on_frame(frame)
+    assert len(b.queue) == 0
