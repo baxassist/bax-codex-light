@@ -13,8 +13,8 @@ from typing import Any
 
 VERSION = 1
 
-# После длительного сбоя проверяем возврат сервера не реже раза в 30 секунд.
-BACKOFF = (1, 2, 5, 10, 30)
+# После длительного сбоя проверяем возврат сервера не реже раза в 5 секунд.
+BACKOFF = (1, 2, 3, 5)
 
 
 def sign(secret: str, nonce: str, ts: int, key_id: str) -> str:

@@ -11,9 +11,9 @@ from bax_codex_light.connection import Relay
 from bax_codex_light.protocol import backoff
 
 
-def test_reconnect_outage_wait_is_bounded_to_thirty_seconds():
-    assert [backoff(i) for i in range(7)] == [1, 2, 5, 10, 30, 30, 30]
-    assert backoff(10000) == 30
+def test_reconnect_outage_wait_is_bounded_to_five_seconds():
+    assert [backoff(i) for i in range(7)] == [1, 2, 3, 5, 5, 5, 5]
+    assert backoff(10000) == 5
 
 
 async def test_real_authenticated_connection_resets_accumulated_backoff(tmp_path, monkeypatch):
