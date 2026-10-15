@@ -380,3 +380,43 @@ async def test_voice_job_has_stable_id_and_ack_after_turn_start(tmp_path):
     assert ack["rid"] == job and ack["turn_id"] == "turn"
     await b.on_frame(frame)
     assert len(b.queue) == 0
+
+
+async def test_client_uuid_deduplicates_queued_and_completed_task(tmp_path):
+    from uuid import uuid4
+
+    b = bridge(tmp_path)
+    cid = str(uuid4())
+    frame = {"type": "run", "rid": cid, "client_id": cid, "text": "Один запуск"}
+    await b.on_frame(frame)
+    await b.on_frame(frame)
+    assert list(b.queue) == [(cid, "Один запуск")]
+    b.app.state = "idle"
+    await b._drain()
+    assert b.app.calls == [("current", "Один запуск")]
+    await b.on_frame(frame)
+    assert len(b.app.calls) == 1
+    assert b.relay.sent[-1]["delivery"] == "accepted"
+    await b.on_frame({**frame, "text": "Другая команда"})
+    assert b.relay.sent[-1]["type"] == "error"
+    assert len(b.app.calls) == 1
+
+
+async def test_unknown_native_rpc_is_reconciled_by_client_id_without_resending(tmp_path):
+    from uuid import uuid4
+
+    b = bridge(tmp_path)
+    b.app.state = "idle"
+    b.app.fail = True
+    cid = str(uuid4())
+    frame = {"type": "run", "rid": cid, "client_id": cid, "text": "Один запуск"}
+    await b.on_frame(frame)
+    await b.on_frame(frame)
+    assert len(b.app.calls) == 1
+    assert b.relay.sent[-1]["delivery"] == "unknown"
+    native = entry("native", "userMessage", "Один запуск")
+    native["item"]["clientId"] = cid
+    b.app.history_items = [native]
+    await b.on_frame(frame)
+    assert len(b.app.calls) == 1
+    assert b.relay.sent[-1]["delivery"] == "accepted"

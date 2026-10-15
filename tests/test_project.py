@@ -625,3 +625,30 @@ async def test_server_voice_job_runs_in_original_background_session_without_sele
         assert any(
             frame["type"] == "voice.accepted" and frame["session"] == "a" for frame in owner.relay.frames
         )
+
+
+async def test_durable_queued_key_survives_restart_and_lost_echo(tmp_path):
+    from uuid import uuid4
+
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        cid = str(uuid4())
+        frame = {"type": "run", "rid": cid, "client_id": cid, "text": "Не терять очередь"}
+        await owner.sessions["a"].accept_run(frame)
+        saved = ProjectController(tmp_path, owner.registry, owner.state_path, owner.endpoint)
+        saved.app = owner.app
+        saved.relay = owner.relay
+        restored = await saved.ensure_session("a")
+        assert list(restored.queue) == [(cid, frame["text"])]
+        await restored.accept_run(frame)
+        assert len(restored.queue) == 1
+        await restored._drain()
+        calls = [call for call in fake.calls if call["method"] in {"turn/start", "turn/steer"}]
+        assert len(calls) == 1
+        assert calls[0]["params"]["clientUserMessageId"] == cid
+        again = ProjectController(tmp_path, owner.registry, owner.state_path, owner.endpoint)
+        again.app, again.relay = owner.app, owner.relay
+        resumed = await again.ensure_session("a")
+        await resumed.accept_run(frame)
+        assert not resumed.queue
+        assert len([call for call in fake.calls if call["method"] in {"turn/start", "turn/steer"}]) == 1

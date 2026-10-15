@@ -72,6 +72,9 @@ class SessionBridge(Bridge):
         self.model_selection: dict | None = None
         self.token_usage: dict = {}
 
+    def persist_delivery(self) -> None:
+        self.owner.save()
+
     def start_options(self) -> dict:
         result = dict(self.model_selection or {})
         if self.permission_selection:
@@ -160,12 +163,18 @@ class ProjectController:
             sessions[thread_id] = {
                 "model_selection": bridge.model_selection,
                 "permission_selection": bridge.permission_selection,
+                "delivery_receipts": bridge.delivery_receipts,
                 "pending": {
                     cid: {
                         "text": item.text,
                         "error": item.error,
                         "steer_allowed": item.steer_allowed,
                         "image_count": item.image_count,
+                        "images": item.images
+                        if bridge.delivery_receipts.get(cid, {}).get("state") == "queued"
+                        else [],
+                        "accepted_text": item.accepted_text,
+                        "voice_job_id": item.voice_job_id,
                         "request_id": item.request_id,
                         "delivery": item.delivery,
                     }
@@ -333,6 +342,7 @@ class ProjectController:
                 isinstance(selection.get(k), str) and selection[k] for k in ("model", "effort")
             ):
                 bridge.model_selection = {k: selection[k] for k in ("model", "effort")}
+            bridge.delivery_receipts = self.saved.get(thread_id, {}).get("delivery_receipts", {})
             for cid, pending in self.saved.get(thread_id, {}).get("pending", {}).items():
                 bridge.outbox[cid] = Submission(
                     pending["text"],
@@ -340,9 +350,15 @@ class ProjectController:
                     or "Контроллер перезапущен. Проверьте историю перед повторной отправкой.",
                     steer_allowed=pending.get("steer_allowed", True),
                     image_count=pending.get("image_count", 0),
+                    images=pending.get("images", []),
+                    accepted_text=pending.get("accepted_text"),
+                    voice_job_id=pending.get("voice_job_id"),
                     request_id=pending.get("request_id"),
                     delivery=pending.get("delivery", "unknown"),
                 )
+                if bridge.delivery_receipts.get(cid, {}).get("state") == "queued":
+                    bridge.outbox[cid].error = ""
+                    bridge.queue.append((cid, pending["text"]))
             self.sessions[thread_id] = bridge
         bridge = self.sessions[thread_id]
         bridge.app = self.app
@@ -396,9 +412,19 @@ class ProjectController:
         }
 
     async def on_ready(self) -> None:
-        await self.send("caps", mode="project", supports=PROJECT_SUPPORTS, remember=True, voice_jobs=True)
+        await self.send(
+            "caps",
+            mode="project",
+            supports=PROJECT_SUPPORTS,
+            remember=True,
+            voice_jobs=True,
+            idempotent_run=True,
+        )
         await self.send("power.settings", **self.power_settings())
         await self.publish_selection()
+        for bridge in list(self.sessions.values()):
+            if bridge.queue:
+                await bridge._drain()
 
     async def send_stats(self, thread_id: str) -> None:
         bridge = self.sessions.get(thread_id)

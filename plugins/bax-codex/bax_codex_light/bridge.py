@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import re
 from collections import deque
@@ -69,6 +71,7 @@ class Bridge:
         self.queue: deque[tuple[str, str]] = deque(maxlen=10)
         # До появления настоящей userMessage в Codex эхо не является историей.
         self.outbox: dict[str, Submission] = {}
+        self.delivery_receipts: dict[str, dict] = {}
         self.turn_id = ""
         self.streamed: set[str] = set()
         self.seen_async_questions: set[str] = set()
@@ -310,6 +313,9 @@ class Bridge:
 
     async def confirm_submission(self, client_id: str) -> None:
         submission = self.outbox.pop(client_id, None)
+        if client_id in self.delivery_receipts:
+            self.delivery_receipts[client_id]["state"] = "accepted"
+            self.persist_delivery()
         if submission and submission.error:
             code = "delivery_rejected" if submission.delivery == "rejected" else "delivery_uncertain"
             rid = submission.request_id or client_id
@@ -466,12 +472,67 @@ class Bridge:
                 delivery="rejected" if frame.get("type") == "run" else "not_applicable",
             )
 
+    def persist_delivery(self) -> None:
+        """Project-режим переопределяет: запись на диск до подтверждения и RPC."""
+
+    async def repeat_delivery(self, client_id: str, frame: dict, fingerprint: str) -> bool:
+        receipt = self.delivery_receipts.get(client_id)
+        if receipt is None:
+            return False
+        if receipt["fingerprint"] != fingerprint:
+            raise ValueError("Ключ сообщения уже использован с другим содержимым")
+        state = receipt["state"]
+        if state in {"inflight", "unknown"}:
+            cursor = None
+            while True:
+                page = await self.app.items(self.thread_id, cursor, 100)
+                if any(item["item"].get("clientId") == client_id for item in page["data"]):
+                    receipt["state"] = state = "accepted"
+                    self.persist_delivery()
+                    break
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    break
+        if state == "accepted":
+            await self.send("error.resolved", rid=frame.get("rid"), delivery="accepted")
+        elif state == "queued":
+            # Очередь уже сохранена; on_frame вызовет _drain без второго элемента.
+            await self.send("run.received", rid=frame.get("rid"), delivery="queued")
+        elif state == "rejected":
+            self.delivery_receipts.pop(client_id)
+            self.outbox.pop(client_id, None)
+            return False
+        else:
+            await self.send_failure(
+                "delivery_uncertain",
+                "Codex пока не подтвердил приём. Проверяю тот же ключ без повторного запуска.",
+                operation="run",
+                rid=frame.get("rid"),
+                delivery="unknown",
+            )
+        return True
+
     async def accept_run(self, frame: dict) -> None:
         # Подготовка большой картинки не меняет порядок следующих текстовых комментариев.
         async with self.input_lock:
             text = frame.get("text")
             if not isinstance(text, str) or len(text) > 100_000:
                 raise ValueError("Текст задачи должен быть не длиннее 100000 символов")
+            raw_id = frame.get("client_id") or frame.get("rid")
+            try:
+                client_id = str(UUID(str(raw_id)))
+            except (ValueError, TypeError):
+                client_id = str(uuid4())
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {"text": text, "attachments": frame.get("attachments") or []},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if await self.repeat_delivery(client_id, frame, fingerprint):
+                return
             if len(self.queue) == self.queue.maxlen:
                 raise ValueError("Очередь заполнена; дождитесь выполнения задач")
             if not self.history or not self.app or self.app.closed.is_set():
@@ -482,7 +543,6 @@ class Bridge:
             if not text.strip() and not picture_inputs:
                 raise ValueError("Нужен текст задачи или картинка")
             voice_job_id = str(UUID(frame["voice_job_id"])) if frame.get("voice_job_id") else None
-            client_id = str(UUID(frame["client_id"])) if voice_job_id else str(uuid4())
             if voice_job_id and client_id in self.outbox:
                 return
             self.queue.append((client_id, text))
@@ -496,6 +556,8 @@ class Bridge:
                 steer_allowed=not bool(voice_job_id),
             )
             self.outbox[client_id] = submission
+            self.delivery_receipts[client_id] = {"fingerprint": fingerprint, "state": "queued"}
+            self.persist_delivery()
             if voice_job_id:
                 await self.send("voice.queued", rid=voice_job_id, client_id=client_id)
             await self.send(
@@ -539,6 +601,10 @@ class Bridge:
                     return
                 # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
                 client_id, text = self.queue[index]
+                receipt = self.delivery_receipts.get(client_id)
+                if receipt is not None:
+                    receipt["state"] = "inflight"
+                    self.persist_delivery()
                 del self.queue[index]
                 if not target_turn:
                     self.state = "busy"
@@ -556,6 +622,10 @@ class Bridge:
                         # если дополнительный запрос настроек временно недоступен.
                         with contextlib.suppress(RPCError, OSError, TimeoutError):
                             await self.model_started()
+                    if receipt is not None:
+                        receipt["state"] = "accepted"
+                        self.persist_delivery()
+                        await self.send("error.resolved", rid=submission.request_id, delivery="accepted")
                     if submission.voice_job_id:
                         await self.send(
                             "voice.accepted", rid=submission.voice_job_id, turn_id=target_turn or self.turn_id
@@ -585,6 +655,9 @@ class Bridge:
                             )
                             return
                         self.queue.insert(index, (client_id, text))
+                        if receipt is not None:
+                            receipt["state"] = "queued"
+                            self.persist_delivery()
                         if client_id not in rejected_steers:
                             rejected_steers.add(client_id)
                             continue
@@ -606,9 +679,12 @@ class Bridge:
                         if isinstance(error, RPCRejected)
                         else "Доставка задачи не подтверждена. Проверьте разговор перед повторной отправкой"
                     )
+                    if receipt is not None:
+                        receipt["state"] = "rejected" if isinstance(error, RPCRejected) else "unknown"
                     if submission := self.outbox.get(client_id):
                         submission.error = message
                         submission.delivery = "rejected" if isinstance(error, RPCRejected) else "unknown"
+                    self.persist_delivery()
                     log.warning("Codex: доставка сообщения %s — %s", client_id, type(error).__name__)
                     await self.send(
                         "error",
