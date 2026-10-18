@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from test_project import project_controller
 
 from bax_codex_light.permission_settings import choices
@@ -19,13 +21,17 @@ async def test_busy_permission_choice_is_durable_and_applies_only_to_next_turn(t
         assert owner.template == template
         restored = ProjectController(tmp_path, owner.registry, owner.state_path)
         assert restored.saved["a"]["permission_selection"] == "read-only"
-        await owner.on_frame({"type": "run", "session": "a", "text": "Поправка", "cid": "steer"})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "Поправка", "cid": "steer"}
+        )
         steer = next(c for c in fake.calls if c["method"] == "turn/steer")
         assert "sandboxPolicy" not in steer["params"] and "approvalPolicy" not in steer["params"]
         assert a.permission_selection == "read-only"
         fake.threads["a"]["status"] = {"type": "idle"}
         a.state, a.turn_id = "ready", ""
-        await owner.on_frame({"type": "run", "session": "a", "text": "Новая задача", "cid": "start"})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "Новая задача", "cid": "start"}
+        )
         start = next(c for c in fake.calls if c["method"] == "turn/start")
         assert start["params"]["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
         assert start["params"]["approvalPolicy"] == "on-request"
@@ -92,7 +98,9 @@ async def test_explicit_full_access_and_return_to_current_mode(tmp_path):
         )
         assert owner.sessions["a"].permission_selection == "full-access"
         assert not fake.permission_configs
-        await owner.on_frame({"type": "run", "session": "a", "text": "Задача", "cid": "start"})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "Задача", "cid": "start"}
+        )
         start = next(c for c in fake.calls if c["method"] == "turn/start")
         assert start["params"]["sandboxPolicy"] == {"type": "dangerFullAccess"}
         assert start["params"]["approvalPolicy"] == "never"

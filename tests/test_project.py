@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 import pytest
 from conftest import FakeApp, entry, thread, until
@@ -301,7 +302,9 @@ async def test_system_error_session_opens_with_history_and_failure_reason(tmp_pa
         )
         assert owner.selected == "a"
         assert not owner.app.closed.is_set()
-        await owner.on_frame({"type": "run", "session": "a", "text": "Повтори запрос"})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "Повтори запрос"}
+        )
         starts = [c["params"] for c in fake.calls if c["method"] == "turn/start"]
         assert len(starts) == 1 and starts[0]["threadId"] == "a"
         assert "model" not in starts[0] and "effort" not in starts[0]
@@ -432,7 +435,9 @@ async def test_new_empty_session_can_be_reselected_and_first_message_is_sent_onc
         await owner.select("new")
         await owner.select("b")
         await owner.select("new-1")
-        await owner.on_frame({"type": "run", "session": "new-1", "text": "Правим вход", "client_id": "first"})
+        await owner.on_frame(
+            {"type": "run", "session": "new-1", "text": "Правим вход", "client_id": str(uuid4())}
+        )
         calls = [c for c in fake.calls if c["method"] == "turn/start"]
         assert len(calls) == 1 and calls[0]["params"]["threadId"] == "new-1"
         assert calls[0]["params"]["input"] == [{"type": "text", "text": "Правим вход"}]
@@ -465,7 +470,9 @@ async def test_stale_run_and_switch_do_not_retarget_messages(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
         await owner.select("b")
-        await owner.on_frame({"type": "run", "session": "a", "text": "старый экран"})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "старый экран"}
+        )
         await owner.on_frame({"type": "session.select", "expected_session": "a", "session": "new"})
         assert owner.selected == "b"
         assert not any(c["method"] in {"turn/start", "thread/start"} for c in fake.calls)

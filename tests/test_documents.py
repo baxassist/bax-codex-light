@@ -1,6 +1,7 @@
 import base64
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from test_images import PHOTO
@@ -63,7 +64,15 @@ def test_existing_ignore_cannot_expose_new_documents(tmp_path):
 async def test_document_only_task_reaches_exact_thread_as_existing_file(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
-        await owner.on_frame({"type": "run", "session": "a", "text": "", "attachments": [document()]})
+        await owner.on_frame(
+            {
+                "client_id": str(uuid4()),
+                "type": "run",
+                "session": "a",
+                "text": "",
+                "attachments": [document()],
+            }
+        )
         sent = next(call for call in fake.calls if call["method"] == "turn/start")["params"]
         assert sent["threadId"] == "a" and sent["input"][0]["type"] == "text"
         assert "Отчёт.pdf" in sent["input"][0]["text"]

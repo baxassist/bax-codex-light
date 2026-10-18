@@ -521,11 +521,13 @@ class Bridge:
             text = frame.get("text")
             if not isinstance(text, str) or len(text) > 100_000:
                 raise ValueError("Текст задачи должен быть не длиннее 100000 символов")
-            raw_id = frame.get("client_id") or frame.get("rid")
             try:
-                client_id = str(UUID(str(raw_id)))
-            except (ValueError, TypeError):
-                client_id = str(uuid4())
+                raw_id = frame["client_id"]
+                if not isinstance(raw_id, str):
+                    raise ValueError
+                client_id = str(UUID(raw_id))
+            except (KeyError, ValueError, TypeError):
+                raise ValueError("Задаче нужен постоянный UUID client_id") from None
             fingerprint = hashlib.sha256(
                 json.dumps(
                     {"text": text, "attachments": frame.get("attachments") or []},

@@ -1,4 +1,5 @@
 import asyncio
+from uuid import uuid4
 
 import pytest
 from test_bridge import bridge
@@ -17,7 +18,7 @@ async def test_busy_comment_uses_current_turn_immediately_without_granting_permi
 
         b.app.inspect = inspect
     b.questions = {"pending": {"card": {"kind": "permission"}, "request_id": 42}}
-    await b.on_frame({"type": "run", "text": "Уточнение: использовать Wi-Fi"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Уточнение: использовать Wi-Fi"})
     assert b.app.steers[0][:3] == ("current", "active-turn", "Уточнение: использовать Wi-Fi")
     assert not b.app.calls and not b.queue
     assert "pending" in b.questions and not b.app.responses
@@ -29,7 +30,9 @@ async def test_live_comments_keep_order_and_are_not_independent_turns(tmp_path):
     b = bridge(tmp_path)
     b.turn_id = "active-turn"
     comments = ["Сначала проверить лог", "Это уточнение к задаче", "Последний вариант актуальный"]
-    await asyncio.gather(*(b.on_frame({"type": "run", "text": text}) for text in comments))
+    await asyncio.gather(
+        *(b.on_frame({"client_id": str(uuid4()), "type": "run", "text": text}) for text in comments)
+    )
     assert [call[2] for call in b.app.steers] == comments
     assert len({call[3] for call in b.app.steers}) == len(comments)
     assert not b.queue and not b.app.calls
@@ -50,7 +53,7 @@ async def test_steer_race_rechecks_exact_turn_after_explicit_rejection(tmp_path,
         return {"turnId": turn_id}
 
     b.app.steer_turn = steer
-    await b.on_frame({"type": "run", "text": "Важное уточнение"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Важное уточнение"})
     if next_state == "active":
         assert [call[1] for call in attempts] == ["old-turn", "new-turn"]
         assert attempts[0][3] == attempts[1][3]
@@ -71,7 +74,7 @@ async def test_repeated_explicit_rejection_retains_queue_with_clear_notice(tmp_p
         raise RPCRejected("temporarily unavailable")
 
     b.app.steer_turn = reject
-    await b.on_frame({"type": "run", "text": "Не потерять комментарий"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Не потерять комментарий"})
     assert len(calls) == 2 and len(b.queue) == 1
     assert any(frame.get("code") == "message_queued" for frame in b.relay.sent)
     b.app.state = "idle"
@@ -90,7 +93,7 @@ async def test_uncertain_live_delivery_is_never_replayed(tmp_path):
         raise TimeoutError()
 
     b.app.steer_turn = timeout
-    await b.on_frame({"type": "run", "text": "Сообщение при обрыве"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Сообщение при обрыве"})
     await b.on_frame({"type": "subscribe"})
     await b._drain()
     assert len(calls) == 1 and not b.queue and not b.app.calls
@@ -117,7 +120,7 @@ async def test_late_async_reply_waits_but_does_not_block_new_live_comment(tmp_pa
     qid = next(iter(b.questions))
     await b.answer({"question_id": qid, "verdict": "choice", "option": "Ответ позже"})
     assert len(b.queue) == 1
-    await b.on_frame({"type": "run", "text": "Комментарий к текущей задаче"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Комментарий к текущей задаче"})
     assert [call[1] for call in steers] == ["previous-turn", "current-turn"]
     assert steers[-1][2] == "Комментарий к текущей задаче"
     assert len(b.queue) == 1 and not b.app.calls
@@ -140,7 +143,7 @@ async def test_rejected_live_comment_is_preserved_if_queue_fills_in_flight(tmp_p
         raise RPCRejected("not accepted")
 
     b.app.steer_turn = reject
-    await b.on_frame({"type": "run", "text": "Сохранить мой текст"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Сохранить мой текст"})
     assert len(b.queue) == b.queue.maxlen
     assert b.status()["delivery_errors"] == 1
     preserved = next(s for s in b.outbox.values() if s.text == "Сохранить мой текст")

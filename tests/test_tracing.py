@@ -1,5 +1,6 @@
 import asyncio
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -91,7 +92,7 @@ async def test_queued_run_uses_saved_parent_and_native_events_require_exact_turn
         return True
 
     b.relay.send = send
-    await b.on_frame({"type": "run", "text": "queued", "traceparent": PARENT})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "queued", "traceparent": PARENT})
     assert next(iter(b.outbox.values())).traceparent == PARENT
     b.app.state = "idle"
     frames.clear()
@@ -116,7 +117,7 @@ async def test_queued_run_uses_saved_parent_and_native_events_require_exact_turn
         assert frames[-1].get("traceparent") == expected
     # A later steering command must not relabel the original native turn.
     b.app.active_turn_id = "turn"
-    await b.on_frame({"type": "run", "text": "steer", "traceparent": OTHER})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "steer", "traceparent": OTHER})
     assert b.turn_traces == {"turn": PARENT}
 
 
@@ -149,7 +150,7 @@ async def test_unknown_native_outcome_retains_original_context_and_has_no_invent
         return True
 
     b.relay.send = send
-    await b.on_frame({"type": "run", "text": "queued", "traceparent": PARENT})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "queued", "traceparent": PARENT})
     b.app.state, b.app.fail = "idle", True
     with command_context({"traceparent": OTHER}):
         await b._drain()

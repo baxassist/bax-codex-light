@@ -1,4 +1,5 @@
 import asyncio
+from uuid import uuid4
 
 import pytest
 from conftest import entry
@@ -83,8 +84,8 @@ def bridge(tmp_path):
 
 async def test_missing_active_turn_id_queues_then_delivers_backlog_in_one_turn(tmp_path):
     b = bridge(tmp_path)
-    await b.on_frame({"type": "run", "text": "первое"})
-    await b.on_frame({"type": "run", "text": "второе"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "первое"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "второе"})
     assert not b.app.calls
     assert len(b.queue) == 2
     b.app.state = "idle"
@@ -97,7 +98,7 @@ async def test_missing_active_turn_id_queues_then_delivers_backlog_in_one_turn(t
 async def test_queued_question_survives_reopening_phone_history(tmp_path):
     b = bridge(tmp_path)
     question = "Какую модель ты используешь для тестов?"
-    await b.on_frame({"type": "run", "text": question})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": question})
     echo = next(frame for frame in b.relay.sent if frame["type"] == "message")
     b.relay.sent.clear()
 
@@ -113,7 +114,7 @@ async def test_uncertain_delivery_never_auto_retries(tmp_path):
     b = bridge(tmp_path)
     b.app.state = "idle"
     b.app.fail = True
-    await b.on_frame({"type": "run", "text": "задача"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "задача"})
     await b._drain()
     assert len(b.app.calls) == 1
     assert not b.queue
@@ -136,7 +137,7 @@ async def test_explicit_rejection_keeps_text_and_reason_without_retry(tmp_path):
         raise RPCRejected("Сессия не принимает прямые задачи")
 
     b.app.start_turn = rejected
-    await b.on_frame({"type": "run", "text": "мой вопрос"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "мой вопрос"})
     await b.on_frame({"type": "subscribe"})
     await b._drain()
 
@@ -149,8 +150,8 @@ async def test_explicit_rejection_keeps_text_and_reason_without_retry(tmp_path):
 
 async def test_rejected_message_does_not_block_next_queued_message(tmp_path):
     b = bridge(tmp_path)
-    await b.on_frame({"type": "run", "text": "отклонённое"})
-    await b.on_frame({"type": "run", "text": "следующее"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "отклонённое"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "следующее"})
     original = b.app.start_turn
 
     async def reject_first(thread_id, text, client_id):
@@ -170,7 +171,7 @@ async def test_late_native_confirmation_removes_uncertainty_without_retry(tmp_pa
     b = bridge(tmp_path)
     b.app.state = "idle"
     b.app.fail = True
-    await b.on_frame({"type": "run", "text": "мой вопрос"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "мой вопрос"})
     client_id = next(iter(b.outbox))
     echo = next(frame for frame in b.relay.sent if frame["type"] == "message")
     native = entry("native", "userMessage", "мой вопрос")
@@ -196,7 +197,7 @@ async def test_queued_echo_does_not_break_history_after_active_answer(tmp_path):
     b = bridge(tmp_path)
     b.app.history_items = [entry("old")]
     await b.send_history()
-    await b.on_frame({"type": "run", "text": "вопрос в очереди"})
+    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "вопрос в очереди"})
     client_id = b.queue[0][0]
     answer = entry("active-answer")
     await b.on_event({"method": "item/completed", "params": {"threadId": "current", "item": answer["item"]}})
@@ -420,3 +421,17 @@ async def test_unknown_native_rpc_is_reconciled_by_client_id_without_resending(t
     await b.on_frame(frame)
     assert len(b.app.calls) == 1
     assert b.relay.sent[-1]["delivery"] == "accepted"
+
+
+@pytest.mark.parametrize("key", [None, "old-client", 42])
+async def test_run_requires_explicit_stable_client_uuid(tmp_path, key):
+    b = bridge(tmp_path)
+    b.app.state = "idle"
+    frame = {"type": "run", "text": "do not execute", "rid": str(uuid4())}
+    if key is not None:
+        frame["client_id"] = key
+    await b.on_frame(frame)
+    assert not b.app.calls and not b.queue and not b.outbox
+    failure = b.relay.sent[-1]
+    assert failure["type"] == "error" and failure["delivery"] == "rejected"
+    assert failure["rid"] == frame["rid"]

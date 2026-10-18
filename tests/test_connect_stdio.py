@@ -107,7 +107,15 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             assert stored.secret == secret
             assert not (stored and (tmp_path / "registry.json").stat().st_mode & 0o077)
             await sockets[0].send(
-                json.dumps({"v": 1, "type": "run", "session": "current", "text": "Добавь страницу контактов"})
+                json.dumps(
+                    {
+                        "client_id": str(uuid4()),
+                        "v": 1,
+                        "type": "run",
+                        "session": "current",
+                        "text": "Добавь страницу контактов",
+                    }
+                )
             )
             await asyncio.wait_for(fake.started.wait(), 5)
             start = next(c for c in fake.calls if c["method"] == "turn/start")

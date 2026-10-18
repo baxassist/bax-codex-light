@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from test_project import project_controller
 
 from bax_codex_light.project import ProjectController
@@ -21,14 +23,30 @@ async def test_busy_choice_is_durable_and_only_changes_next_start(tmp_path):
         assert all(call["method"] in {"thread/read", "model/list"} for call in fake.calls)
         restored = ProjectController(tmp_path, owner.registry, owner.state_path)
         assert restored.saved["a"]["model_selection"] == {"model": "other-model", "effort": "low"}
-        await owner.on_frame({"type": "run", "session": "a", "text": "Поправка сейчас", "cid": "steer"})
+        await owner.on_frame(
+            {
+                "client_id": str(uuid4()),
+                "type": "run",
+                "session": "a",
+                "text": "Поправка сейчас",
+                "cid": "steer",
+            }
+        )
         steer = next(c for c in fake.calls if c["method"] == "turn/steer")
         assert steer["params"]["expectedTurnId"] == "turn-a"
         assert "model" not in steer["params"] and "effort" not in steer["params"]
         assert a.model_selection is not None
         fake.threads["a"]["status"] = {"type": "idle"}
         a.state, a.turn_id = "ready", ""
-        await owner.on_frame({"type": "run", "session": "a", "text": "Следующая задача", "cid": "start"})
+        await owner.on_frame(
+            {
+                "client_id": str(uuid4()),
+                "type": "run",
+                "session": "a",
+                "text": "Следующая задача",
+                "cid": "start",
+            }
+        )
         start = next(c for c in fake.calls if c["method"] == "turn/start")
         assert start["params"]["model"] == "other-model" and start["params"]["effort"] == "low"
         assert "approvalPolicy" not in start["params"] and "sandbox" not in start["params"]

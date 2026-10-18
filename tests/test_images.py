@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+from uuid import uuid4
 
 import pytest
 from conftest import FakeApp, until
@@ -23,8 +24,24 @@ INPUT = {"type": "image", "url": "data:image/png;base64," + PNG}
 async def test_image_with_text_and_image_only_use_exact_thread_and_active_turn(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
-        await owner.on_frame({"type": "run", "session": "a", "text": "Что на фото?", "attachments": [PHOTO]})
-        await owner.on_frame({"type": "run", "session": "a", "text": "", "attachments": [PHOTO, PHOTO]})
+        await owner.on_frame(
+            {
+                "client_id": str(uuid4()),
+                "type": "run",
+                "session": "a",
+                "text": "Что на фото?",
+                "attachments": [PHOTO],
+            }
+        )
+        await owner.on_frame(
+            {
+                "client_id": str(uuid4()),
+                "type": "run",
+                "session": "a",
+                "text": "",
+                "attachments": [PHOTO, PHOTO],
+            }
+        )
         calls = [c for c in fake.calls if c["method"] in {"turn/start", "turn/steer"}]
         assert [c["method"] for c in calls] == ["turn/start", "turn/steer"]
         assert calls[0]["params"]["input"] == [{"type": "text", "text": "Что на фото?"}, INPUT]
@@ -40,7 +57,9 @@ async def test_stale_image_is_never_sent_to_new_selection(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
         await owner.select("b")
-        await owner.on_frame({"type": "run", "session": "a", "text": "", "attachments": [PHOTO]})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "", "attachments": [PHOTO]}
+        )
         assert not any(c["method"].startswith("turn/") for c in fake.calls)
         assert owner.relay.frames[-1]["type"] == "error"
 
@@ -53,6 +72,7 @@ async def test_preparing_image_does_not_reorder_concurrent_comments(tmp_path):
             *(
                 owner.sessions["a"].on_frame(
                     {
+                        "client_id": str(uuid4()),
                         "type": "run",
                         "text": text,
                         "attachments": [PHOTO] if index == 0 else [],
@@ -93,7 +113,15 @@ async def test_image_larger_than_old_relay_limit_reaches_native_app_server(tmp_p
             await bridge.start()
             await until(lambda: bool(sockets))
             await sockets[0].send(
-                json.dumps({"v": 1, "type": "run", "text": "", "attachments": [dict(PHOTO, data=encoded)]})
+                json.dumps(
+                    {
+                        "client_id": str(uuid4()),
+                        "v": 1,
+                        "type": "run",
+                        "text": "",
+                        "attachments": [dict(PHOTO, data=encoded)],
+                    }
+                )
             )
             await asyncio.wait_for(fake.started.wait(), 5)
             call = next(c for c in fake.calls if c["method"] == "turn/start")
@@ -112,7 +140,9 @@ async def test_uncertain_image_delivery_is_not_replayed_or_duplicated_on_disk(tm
             raise TimeoutError
 
         owner.app.start_turn = timed_out
-        await owner.on_frame({"type": "run", "session": "a", "text": "", "attachments": [PHOTO]})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "", "attachments": [PHOTO]}
+        )
         await owner.sessions["a"]._drain()
         owner.save()
         saved = json.loads(owner.state_path.read_text())
@@ -141,7 +171,9 @@ async def test_rejected_steer_retains_image_until_retry_is_accepted(tmp_path):
             return await original(*args, **kwargs)
 
         owner.app.steer_turn = reject_first
-        await owner.on_frame({"type": "run", "session": "a", "text": "", "attachments": [PHOTO]})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "", "attachments": [PHOTO]}
+        )
         assert attempts == [[INPUT], [INPUT]]
         assert not owner.sessions["a"].queue
 
@@ -162,7 +194,9 @@ async def test_invalid_images_are_rejected_before_echo_or_codex_submission(tmp_p
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
         owner.relay.frames.clear()
-        await owner.on_frame({"type": "run", "session": "a", "text": "", "attachments": attachments})
+        await owner.on_frame(
+            {"client_id": str(uuid4()), "type": "run", "session": "a", "text": "", "attachments": attachments}
+        )
         assert not any(c["method"].startswith("turn/") for c in fake.calls)
         assert not owner.sessions["a"].outbox
         assert [f["type"] for f in owner.relay.frames] == ["error"]

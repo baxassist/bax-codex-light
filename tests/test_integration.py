@@ -52,7 +52,9 @@ async def test_relay_hmac_thread_history_run_and_live_answer(tmp_path):
         try:
             await b.start()
             await until(lambda: any(f.get("text") == "Последний ответ" for f in mobile))
-            await engine_socket[0].send(json.dumps({"v": 1, "type": "run", "text": "Задача с телефона"}))
+            await engine_socket[0].send(
+                json.dumps({"client_id": str(uuid4()), "v": 1, "type": "run", "text": "Задача с телефона"})
+            )
             await asyncio.wait_for(fake.started.wait(), 2)
             start = next(c for c in fake.calls if c["method"] == "turn/start")
             assert start["params"] == {
@@ -141,7 +143,9 @@ async def test_busy_comment_is_steered_immediately_and_history_reconnect_does_no
         try:
             await b.start()
             await until(lambda: any(frame.get("type") == "background" for frame in mobile))
-            await sockets[-1].send(json.dumps({"v": 1, "type": "run", "text": question}))
+            await sockets[-1].send(
+                json.dumps({"client_id": str(uuid4()), "v": 1, "type": "run", "text": question})
+            )
             await until(lambda: len(questions()) == 1)
             await until(lambda: any(call["method"] == "turn/steer" for call in fake.calls))
             preview_id = questions()[0]["id"]
