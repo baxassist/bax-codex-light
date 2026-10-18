@@ -19,6 +19,7 @@ from . import __version__
 from .power import IdleSleepGuard
 from .protocol import backoff, frame, parse, sign
 from .registry import Registration
+from .tracing import command_context, response_fields
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ class Relay:
         if not self.connected or self.ws is None:
             return False
         try:
-            await self.ws.send(frame(frame_type, **fields))
+            await self.ws.send(frame(frame_type, **response_fields(fields)))
             return True
         except Exception:
             return False
@@ -163,7 +164,8 @@ class Relay:
                     if message.get("type") == "ping":
                         await ws.send(frame("pong"))
                     elif message.get("type") != "pong":
-                        await on_frame(message)
+                        with command_context(message):
+                            await on_frame(message)
             finally:
                 if self.connected:
                     self.last_disconnected_at = time.time()

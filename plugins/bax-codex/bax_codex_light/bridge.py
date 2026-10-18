@@ -21,6 +21,7 @@ from .errors import failure_fields, safe_message
 from .history import History, identity, render, stopped_entry
 from .preferences import Preferences
 from .registry import Registration, Registry
+from .tracing import command_context
 
 log = logging.getLogger(__name__)
 SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read", "power.get", "power.set"]
@@ -580,6 +581,12 @@ class Bridge:
         pass
 
     async def _drain(self) -> None:
+        # Очередь может содержать другую команду, принятую до текущего callback.
+        # Привязка её исполнения требует сохранённого контекста самой Submission.
+        with command_context():
+            await self._drain_queue()
+
+    async def _drain_queue(self) -> None:
         async with self.lock:
             rejected_steers = set()
             while self.queue and self.app:
