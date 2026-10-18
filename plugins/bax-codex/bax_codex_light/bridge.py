@@ -21,7 +21,7 @@ from .errors import failure_fields, safe_message
 from .history import History, identity, render, stopped_entry
 from .preferences import Preferences
 from .registry import Registration, Registry
-from .tracing import command_context
+from .tracing import command_context, valid_parent
 
 log = logging.getLogger(__name__)
 SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read", "power.get", "power.set"]
@@ -40,6 +40,7 @@ class Submission:
     image_count: int = 0
     accepted_text: str | None = None
     voice_job_id: str | None = None
+    traceparent: str | None = None
 
     @property
     def preview(self) -> str:
@@ -72,6 +73,7 @@ class Bridge:
         self.queue: deque[tuple[str, str]] = deque(maxlen=10)
         # До появления настоящей userMessage в Codex эхо не является историей.
         self.outbox: dict[str, Submission] = {}
+        self.turn_traces: dict[str, str] = {}
         self.delivery_receipts: dict[str, dict] = {}
         self.turn_id = ""
         self.streamed: set[str] = set()
@@ -554,6 +556,7 @@ class Bridge:
                 accepted_text=frame["text"] if document_text else None,
                 request_id=frame.get("rid"),
                 voice_job_id=voice_job_id,
+                traceparent=frame.get("traceparent") if valid_parent(frame.get("traceparent")) else None,
                 steer_allowed=not bool(voice_job_id),
             )
             self.outbox[client_id] = submission
@@ -608,109 +611,131 @@ class Bridge:
                     return
                 # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
                 client_id, text = self.queue[index]
-                receipt = self.delivery_receipts.get(client_id)
-                if receipt is not None:
-                    receipt["state"] = "inflight"
-                    self.persist_delivery()
-                del self.queue[index]
-                if not target_turn:
-                    self.state = "busy"
-                await self.send("status", state=self.state)
-                try:
-                    submission = self.outbox[client_id]
-                    extra = {"images": submission.images} if submission.images else {}
-                    if target_turn:
-                        await self.app.steer_turn(self.thread_id, target_turn, text, client_id, **extra)
-                    else:
-                        extra.update(self.start_options())
-                        result = await self.app.start_turn(self.thread_id, text, client_id, **extra)
-                        self.turn_id = result["turn"]["id"]
-                        # Не превращаем уже принятое сообщение в ошибку доставки,
-                        # если дополнительный запрос настроек временно недоступен.
-                        with contextlib.suppress(RPCError, OSError, TimeoutError):
-                            await self.model_started()
+                with command_context({"traceparent": self.outbox[client_id].traceparent}):
+                    receipt = self.delivery_receipts.get(client_id)
                     if receipt is not None:
-                        receipt["state"] = "accepted"
+                        receipt["state"] = "inflight"
                         self.persist_delivery()
-                        await self.send("error.resolved", rid=submission.request_id, delivery="accepted")
-                    if submission.voice_job_id:
-                        await self.send(
-                            "voice.accepted", rid=submission.voice_job_id, turn_id=target_turn or self.turn_id
-                        )
-                    # После приёма изображение хранит Codex; мост оставляет только метаданные эха.
-                    submission.images = []
-                    log.info("Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id)
-                except Exception as error:
-                    if target_turn and isinstance(error, RPCRejected):
-                        # Явный отказ означает, что сообщение не принято. Ход мог
-                        # закончиться между проверкой и steer: сверяем ID ещё один раз.
-                        self.turn_id = ""
-                        if len(self.queue) == self.queue.maxlen:
-                            message = (
-                                "Codex не принял комментарий, а очередь уже заполнена. "
-                                "Текст сохранён в ленте; повторите отправку после доставки "
-                                "ожидающих сообщений."
+                    del self.queue[index]
+                    if not target_turn:
+                        self.state = "busy"
+                    await self.send("status", state=self.state)
+                    try:
+                        submission = self.outbox[client_id]
+                        extra = {"images": submission.images} if submission.images else {}
+                        if target_turn:
+                            await self.app.steer_turn(self.thread_id, target_turn, text, client_id, **extra)
+                        else:
+                            extra.update(self.start_options())
+                            result = await self.app.start_turn(self.thread_id, text, client_id, **extra)
+                            self.turn_id = result["turn"]["id"]
+                            if submission.traceparent:
+                                self.turn_traces.setdefault(self.turn_id, submission.traceparent)
+                                while len(self.turn_traces) > 128:
+                                    self.turn_traces.pop(next(iter(self.turn_traces)))
+                                self.persist_delivery()
+                            # Не превращаем уже принятое сообщение в ошибку доставки,
+                            # если дополнительный запрос настроек временно недоступен.
+                            with contextlib.suppress(RPCError, OSError, TimeoutError):
+                                await self.model_started()
+                        if receipt is not None:
+                            receipt["state"] = "accepted"
+                            self.persist_delivery()
+                            await self.send("error.resolved", rid=submission.request_id, delivery="accepted")
+                        if submission.voice_job_id:
+                            await self.send(
+                                "voice.accepted",
+                                rid=submission.voice_job_id,
+                                turn_id=target_turn or self.turn_id,
                             )
-                            self.outbox[client_id].error = message
-                            self.outbox[client_id].delivery = "rejected"
-                            await self.send_failure(
-                                "delivery_rejected",
-                                message,
-                                operation="run",
-                                rid=self.outbox[client_id].request_id or client_id,
-                                delivery="rejected",
+                        # После приёма изображение хранит Codex; мост оставляет только метаданные эха.
+                        submission.images = []
+                        log.info(
+                            "Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id
+                        )
+                    except Exception as error:
+                        if target_turn and isinstance(error, RPCRejected):
+                            # Явный отказ означает, что сообщение не принято. Ход мог
+                            # закончиться между проверкой и steer: сверяем ID ещё один раз.
+                            self.turn_id = ""
+                            if len(self.queue) == self.queue.maxlen:
+                                message = (
+                                    "Codex не принял комментарий, а очередь уже заполнена. "
+                                    "Текст сохранён в ленте; повторите отправку после доставки "
+                                    "ожидающих сообщений."
+                                )
+                                self.outbox[client_id].error = message
+                                self.outbox[client_id].delivery = "rejected"
+                                await self.send_failure(
+                                    "delivery_rejected",
+                                    message,
+                                    operation="run",
+                                    rid=self.outbox[client_id].request_id or client_id,
+                                    delivery="rejected",
+                                )
+                                return
+                            self.queue.insert(index, (client_id, text))
+                            if receipt is not None:
+                                receipt["state"] = "queued"
+                                self.persist_delivery()
+                            if client_id not in rejected_steers:
+                                rejected_steers.add(client_id)
+                                continue
+                            await self.send(
+                                "error",
+                                **failure_fields(
+                                    "message_queued",
+                                    "Codex пока не принял комментарий. Сообщение сохранено в очереди "
+                                    "и будет доставлено, когда ход станет доступен.",
+                                    operation="run",
+                                    rid=self.outbox[client_id].request_id or client_id,
+                                ),
                             )
                             return
-                        self.queue.insert(index, (client_id, text))
+                        # Повтор требует решения человека; предварительное эхо остаётся
+                        # видимым до подтверждения настоящей историей Codex.
+                        message = (
+                            f"Codex отклонил сообщение: {safe_message(error)}"
+                            if isinstance(error, RPCRejected)
+                            else (
+                                "Доставка задачи не подтверждена. "
+                                "Проверьте разговор перед повторной отправкой"
+                            )
+                        )
                         if receipt is not None:
-                            receipt["state"] = "queued"
-                            self.persist_delivery()
-                        if client_id not in rejected_steers:
-                            rejected_steers.add(client_id)
-                            continue
+                            receipt["state"] = "rejected" if isinstance(error, RPCRejected) else "unknown"
+                        if submission := self.outbox.get(client_id):
+                            submission.error = message
+                            submission.delivery = "rejected" if isinstance(error, RPCRejected) else "unknown"
+                        self.persist_delivery()
+                        log.warning("Codex: доставка сообщения %s — %s", client_id, type(error).__name__)
                         await self.send(
                             "error",
                             **failure_fields(
-                                "message_queued",
-                                "Codex пока не принял комментарий. Сообщение сохранено в очереди "
-                                "и будет доставлено, когда ход станет доступен.",
+                                "delivery_rejected"
+                                if isinstance(error, RPCRejected)
+                                else "delivery_uncertain",
+                                message,
                                 operation="run",
                                 rid=self.outbox[client_id].request_id or client_id,
+                                delivery="rejected" if isinstance(error, RPCRejected) else "unknown",
+                                info=getattr(error, "native_info", None),
                             ),
                         )
-                        return
-                    # Повтор требует решения человека; предварительное эхо остаётся
-                    # видимым до подтверждения настоящей историей Codex.
-                    message = (
-                        f"Codex отклонил сообщение: {safe_message(error)}"
-                        if isinstance(error, RPCRejected)
-                        else "Доставка задачи не подтверждена. Проверьте разговор перед повторной отправкой"
-                    )
-                    if receipt is not None:
-                        receipt["state"] = "rejected" if isinstance(error, RPCRejected) else "unknown"
-                    if submission := self.outbox.get(client_id):
-                        submission.error = message
-                        submission.delivery = "rejected" if isinstance(error, RPCRejected) else "unknown"
-                    self.persist_delivery()
-                    log.warning("Codex: доставка сообщения %s — %s", client_id, type(error).__name__)
-                    await self.send(
-                        "error",
-                        **failure_fields(
-                            "delivery_rejected" if isinstance(error, RPCRejected) else "delivery_uncertain",
-                            message,
-                            operation="run",
-                            rid=self.outbox[client_id].request_id or client_id,
-                            delivery="rejected" if isinstance(error, RPCRejected) else "unknown",
-                            info=getattr(error, "native_info", None),
-                        ),
-                    )
-                    if isinstance(error, RPCRejected):
-                        with contextlib.suppress(Exception):
-                            thread = await self.app.inspect(self.thread_id, self.project)
-                            self._set_state(thread["status"])
-                            await self.send("status", state=self.state)
+                        if isinstance(error, RPCRejected):
+                            with contextlib.suppress(Exception):
+                                thread = await self.app.inspect(self.thread_id, self.project)
+                                self._set_state(thread["status"])
+                                await self.send("status", state=self.state)
 
     async def on_event(self, event: dict) -> None:
+        params = event.get("params", {})
+        turn_id = params.get("turnId") or params.get("turn", {}).get("id")
+        # Только подтверждённый native turn; текущая сессия/последний run не доказательство.
+        with command_context({"traceparent": self.turn_traces.get(turn_id)}):
+            await self._on_event(event)
+
+    async def _on_event(self, event: dict) -> None:
         params = event.get("params", {})
         if params.get("threadId") != self.thread_id:
             return

@@ -22,6 +22,7 @@ from .history import History
 from .permission_settings import PRESETS, choices, mode_of, options
 from .preferences import Preferences
 from .registry import Registration, Registry
+from .tracing import valid_parent
 
 log = logging.getLogger(__name__)
 PROJECT_SUPPORTS = [
@@ -164,6 +165,7 @@ class ProjectController:
                 "model_selection": bridge.model_selection,
                 "permission_selection": bridge.permission_selection,
                 "delivery_receipts": bridge.delivery_receipts,
+                "turn_traces": bridge.turn_traces,
                 "pending": {
                     cid: {
                         "text": item.text,
@@ -175,6 +177,7 @@ class ProjectController:
                         else [],
                         "accepted_text": item.accepted_text,
                         "voice_job_id": item.voice_job_id,
+                        "traceparent": item.traceparent,
                         "request_id": item.request_id,
                         "delivery": item.delivery,
                     }
@@ -343,6 +346,13 @@ class ProjectController:
             ):
                 bridge.model_selection = {k: selection[k] for k in ("model", "effort")}
             bridge.delivery_receipts = self.saved.get(thread_id, {}).get("delivery_receipts", {})
+            bridge.turn_traces = {
+                key: value
+                for key, value in self.saved.get(thread_id, {}).get("turn_traces", {}).items()
+                if isinstance(key, str) and key and valid_parent(value)
+            }
+            while len(bridge.turn_traces) > 128:
+                bridge.turn_traces.pop(next(iter(bridge.turn_traces)))
             for cid, pending in self.saved.get(thread_id, {}).get("pending", {}).items():
                 bridge.outbox[cid] = Submission(
                     pending["text"],
@@ -353,6 +363,9 @@ class ProjectController:
                     images=pending.get("images", []),
                     accepted_text=pending.get("accepted_text"),
                     voice_job_id=pending.get("voice_job_id"),
+                    traceparent=pending.get("traceparent")
+                    if valid_parent(pending.get("traceparent"))
+                    else None,
                     request_id=pending.get("request_id"),
                     delivery=pending.get("delivery", "unknown"),
                 )

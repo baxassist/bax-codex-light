@@ -78,3 +78,83 @@ async def test_real_transport_correlates_reply_without_leaking_to_next_command(t
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+
+async def test_queued_run_uses_saved_parent_and_native_events_require_exact_turn(tmp_path):
+    from test_bridge import bridge
+
+    b = bridge(tmp_path)
+    frames = []
+
+    async def send(frame_type, **fields):
+        frames.append({"type": frame_type, **response_fields(fields)})
+        return True
+
+    b.relay.send = send
+    await b.on_frame({"type": "run", "text": "queued", "traceparent": PARENT})
+    assert next(iter(b.outbox.values())).traceparent == PARENT
+    b.app.state = "idle"
+    frames.clear()
+    with command_context({"traceparent": OTHER}):
+        await b._drain()
+    assert b.turn_traces == {"turn": PARENT}
+    accepted = next(frame for frame in frames if frame["type"] == "error.resolved")
+    assert accepted["traceparent"] == PARENT
+    for turn, expected in [("turn", PARENT), ("foreign", None)]:
+        frames.clear()
+        await b.on_event(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "current",
+                    "turnId": turn,
+                    "itemId": "answer-" + turn,
+                    "delta": "text",
+                },
+            }
+        )
+        assert frames[-1].get("traceparent") == expected
+    # A later steering command must not relabel the original native turn.
+    b.app.active_turn_id = "turn"
+    await b.on_frame({"type": "run", "text": "steer", "traceparent": OTHER})
+    assert b.turn_traces == {"turn": PARENT}
+
+
+async def test_project_restart_preserves_submission_and_confirmed_turn_context(tmp_path):
+    from test_project import project_controller
+
+    from bax_codex_light.bridge import Submission
+    from bax_codex_light.project import ProjectController
+
+    async with project_controller(tmp_path) as (_fake, owner):
+        session = await owner.ensure_session("a")
+        session.outbox["pending"] = Submission("source", traceparent=PARENT)
+        session.turn_traces["confirmed-turn"] = OTHER
+        owner.save()
+        restored = ProjectController(tmp_path, owner.registry, owner.state_path, owner.endpoint)
+        restored.app = owner.app
+        recovered = await restored.ensure_session("a")
+        assert recovered.outbox["pending"].traceparent == PARENT
+        assert recovered.turn_traces == {"confirmed-turn": OTHER}
+
+
+async def test_unknown_native_outcome_retains_original_context_and_has_no_invented_turn(tmp_path):
+    from test_bridge import bridge
+
+    b = bridge(tmp_path)
+    frames = []
+
+    async def send(frame_type, **fields):
+        frames.append({"type": frame_type, **response_fields(fields)})
+        return True
+
+    b.relay.send = send
+    await b.on_frame({"type": "run", "text": "queued", "traceparent": PARENT})
+    b.app.state, b.app.fail = "idle", True
+    with command_context({"traceparent": OTHER}):
+        await b._drain()
+    failure = next(frame for frame in frames if frame["type"] == "error")
+    assert failure["traceparent"] == PARENT and failure["delivery"] == "unknown"
+    assert not b.turn_traces
+    assert next(iter(b.outbox.values())).traceparent == PARENT
+    assert not b.queue  # No automatic native retry after an unknown outcome.
