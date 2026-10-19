@@ -65,6 +65,10 @@ async def test_real_transport_correlates_reply_without_leaking_to_next_command(t
         pass
 
     async def handle(message):
+        from bax_codex_light.tracing import dependency
+
+        with dependency("filesystem", "read"):
+            await asyncio.sleep(0)
         await connection.send("history.done")
 
     async with serve(server, "127.0.0.1", 0, ping_interval=None) as listener:
@@ -74,6 +78,8 @@ async def test_real_transport_correlates_reply_without_leaking_to_next_command(t
         try:
             await asyncio.wait_for(completed.wait(), 5)
             assert received[0]["traceparent"] == PARENT
+            assert received[0]["dependency_timings"][0]["operation"] == "read"
+            assert "dependency_timings" not in received[1]
             assert "traceparent" not in received[1]
         finally:
             task.cancel()
@@ -159,3 +165,61 @@ async def test_unknown_native_outcome_retains_original_context_and_has_no_invent
     assert not b.turn_traces
     assert next(iter(b.outbox.values())).traceparent == PARENT
     assert not b.queue  # No automatic native retry after an unknown outcome.
+
+
+async def test_dependency_timings_are_bounded_private_and_owned_by_the_exact_command():
+    from bax_codex_light.tracing import dependency
+
+    with command_context({"traceparent": PARENT}):
+        with dependency("codex", "thread/read"):
+            await asyncio.sleep(0)
+        foreign = response_fields({"traceparent": OTHER})
+        assert "dependency_timings" not in foreign
+        reply = response_fields({})
+        (timing,) = reply["dependency_timings"]
+        assert timing["operation"] == "thread/read" and timing["elapsed_ms"] >= 0
+        assert set(timing) == {"system", "operation", "elapsed_ms", "started_at_ms", "outcome"}
+        assert response_fields({}) == {"traceparent": PARENT}
+
+        async def background():
+            with dependency("filesystem", "read"):
+                pass
+            return response_fields({})
+
+        assert await asyncio.create_task(background()) == {}
+        for _ in range(40):
+            with dependency("filesystem", "read"):
+                pass
+        reply = response_fields({})
+        assert len(reply["dependency_timings"]) == 32 and reply["dependency_timings_dropped"] == 8
+
+
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+async def test_dependency_error_and_cancel_do_not_export_error_messages(error):
+    from bax_codex_light.tracing import dependency
+
+    with command_context({"traceparent": PARENT}):
+        with pytest.raises(error), dependency("filesystem", "read"):
+            raise error("secret file contents")
+        reply = response_fields({})
+        assert reply["dependency_timings"][0]["outcome"] == "error"
+        assert "secret" not in repr(reply)
+
+
+async def test_actual_native_rpc_timing_excludes_serialization_and_binds_to_reply():
+    from bax_codex_light.appserver import AppServer
+
+    app = AppServer(endpoint="synthetic-unused")
+
+    class Socket:
+        async def send(self, payload):
+            request = json.loads(payload)
+            app.pending[request["id"]].set_result({"result": "private response"})
+
+    app.ws = Socket()
+    with command_context({"traceparent": PARENT}):
+        assert await app.request("thread/read", {"threadId": "private-id"}) == {"result": "private response"}
+        reply = response_fields({})
+    (timing,) = reply["dependency_timings"]
+    assert timing["operation"] == "thread/read"
+    assert "private" not in repr(reply)

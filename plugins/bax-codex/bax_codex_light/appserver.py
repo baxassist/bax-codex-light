@@ -19,6 +19,7 @@ from websockets.asyncio.client import connect, unix_connect
 from . import __version__, background
 from .history import stopped_entry
 from .response_metadata import ResponseMetadata
+from .tracing import dependency
 
 EventHandler = Callable[[dict], Awaitable[None]]
 EMPTY_THREAD_NAME = "Новая сессия"
@@ -158,8 +159,10 @@ class AppServer:
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
         try:
-            await self.ws.send(json.dumps({"id": request_id, "method": method, "params": params}))
-            return await asyncio.wait_for(future, self.timeout)
+            payload = json.dumps({"id": request_id, "method": method, "params": params})
+            with dependency("codex", method):
+                await self.ws.send(payload)
+                return await asyncio.wait_for(future, self.timeout)
         finally:
             self.pending.pop(request_id, None)
 
