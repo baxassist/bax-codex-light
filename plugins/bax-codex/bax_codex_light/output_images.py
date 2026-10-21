@@ -12,7 +12,7 @@ from urllib.parse import unquote
 from .files import allowed
 from .images import MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES
 
-LINK = re.compile(r"\!?\[([^\]\n]*)\]\((sandbox:/[^\s)]+|/[^\s)]+)\)")
+LINK = re.compile(r"\!?\[([^\]\n]*)\]\((?:<((?:sandbox:/|/)[^<>\r\n]+)>|((?:sandbox:/|/)[^\s)]+))\)")
 
 
 def collect(project: Path, thread_id: str, text: str) -> list[dict]:
@@ -21,7 +21,8 @@ def collect(project: Path, thread_id: str, text: str) -> list[dict]:
     text = re.sub(r"```.*?(?:```|$)", "", text, flags=re.S)
     text = re.sub(r"`[^`\n]*`", "", text)
     for match in LINK.finditer(text):
-        label, url = match.groups()
+        label, quoted_url, bare_url = match.groups()
+        url = quoted_url or bare_url
         if url in seen or len(result) >= MAX_IMAGES:
             continue
         seen.add(url)
