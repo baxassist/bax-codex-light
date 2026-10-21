@@ -598,11 +598,12 @@ class ProjectController:
                     pending.set_result({k: v for k, v in frame.items() if k not in {"v", "type", "rid"}})
             elif kind == "subscribe":
                 await self.on_ready()
-                bridge = self.sessions.get(self.selected)
+                selected = self.selected
+                bridge = self.sessions.get(selected)
                 if bridge:
-                    await bridge.send_history()
+                    await bridge.send_history(limit=max(1, min(int(frame.get("limit", 50)), 100)))
                     await bridge.show_question()
-                await self.send("history.done", session=self.selected)
+                await self.send("history.done", session=selected)
                 if bridge:
                     await bridge.send_failures()
                 await self.send_sessions()

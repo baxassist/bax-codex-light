@@ -429,7 +429,7 @@ class Bridge:
             kind = frame.get("type")
             if kind == "subscribe":
                 await self.on_ready()
-                await self.send_history()
+                await self.send_history(limit=max(1, min(int(frame.get("limit", 50)), 100)))
                 await self.show_question()
                 await self.send("background", tasks=[])
                 await self.send("status", state=self.state)
@@ -439,6 +439,7 @@ class Bridge:
                 await self.send_history(
                     int(frame.get("before", 0)), max(1, min(int(frame.get("limit", 50)), 100))
                 )
+                await self.send("history.done")
                 await self.send_failures()
             elif kind == "run":
                 await self.accept_run(frame)

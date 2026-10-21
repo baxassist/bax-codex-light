@@ -9,6 +9,7 @@ import socket
 import ssl
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from .registry import Registration
 from .tracing import command_context, response_fields
 
 log = logging.getLogger(__name__)
+_history_rid: ContextVar[str | None] = ContextVar("history_rid", default=None)
 
 
 class RelayResponseError(RuntimeError):
@@ -90,6 +92,8 @@ class Relay:
         if not self.connected or self.ws is None:
             return False
         try:
+            if (rid := _history_rid.get()) and frame_type in {"message", "history.done", "error"}:
+                fields["history_rid"] = rid
             await self.ws.send(frame(frame_type, **response_fields(fields)))
             return True
         except Exception:
@@ -128,6 +132,26 @@ class Relay:
             reg.server, max_size=16 * 1024 * 1024, open_timeout=20, ping_interval=20, ping_timeout=20
         ) as ws:
             self.ws = ws
+            history_task: asyncio.Task | None = None
+
+            async def cancel_history():
+                nonlocal history_task
+                if history_task is not None:
+                    history_task.cancel()
+                    await asyncio.gather(history_task, return_exceptions=True)
+                    history_task = None
+
+            async def read_history(message):
+                token = _history_rid.set(message.get("rid"))
+                try:
+                    with command_context(message):
+                        await on_frame(message)
+                except Exception:
+                    # Ошибка фонового чтения не теряется и не оставляет полуживой канал.
+                    await ws.close(code=1011, reason="History transfer failed")
+                finally:
+                    _history_rid.reset(token)
+
             try:
                 await ws.send(
                     frame(
@@ -164,9 +188,16 @@ class Relay:
                     if message.get("type") == "ping":
                         await ws.send(frame("pong"))
                     elif message.get("type") != "pong":
-                        with command_context(message):
-                            await on_frame(message)
+                        if message.get("type") in {"subscribe", "history"}:
+                            await cancel_history()
+                            history_task = asyncio.create_task(read_history(message))
+                        else:
+                            if message.get("type") in {"session.select", "session.close"}:
+                                await cancel_history()
+                            with command_context(message):
+                                await on_frame(message)
             finally:
+                await cancel_history()
                 if self.connected:
                     self.last_disconnected_at = time.time()
                 self.connected = False
