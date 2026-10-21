@@ -61,6 +61,9 @@ async def test_async_question_buttons_and_reply_use_exact_conversation(tmp_path,
             await fake.emit("item/completed", finish)
             await asyncio.sleep(0.02)
             assert not bridge.questions
+            assert any(
+                f.get("delivery") == "accepted" and f.get("question_id") == qid for f in bridge.relay.sent
+            )
             assert not any(call["method"] == "thread/start" for call in fake.calls)
         finally:
             await app.close()
@@ -189,6 +192,12 @@ async def test_uncertain_async_answer_is_not_sent_twice(tmp_path):
     assert not bridge.questions
     assert any(frame.get("code") == "delivery_uncertain" for frame in bridge.relay.sent)
     assert "private exception" not in str(bridge.relay.sent)
+    assert not any(
+        f.get("delivery") == "accepted" and f["type"] == "question.resolved" for f in bridge.relay.sent
+    )
+    pending_id = next(iter(bridge.outbox))
+    await bridge.confirm_submission(pending_id)
+    assert any(f.get("delivery") == "accepted" and f.get("question_id") == qid for f in bridge.relay.sent)
 
 
 @pytest.mark.parametrize("structured", [True, False])

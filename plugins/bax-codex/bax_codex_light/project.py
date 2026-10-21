@@ -180,6 +180,7 @@ class ProjectController:
                         "traceparent": item.traceparent,
                         "request_id": item.request_id,
                         "delivery": item.delivery,
+                        "answer_question_ids": item.answer_question_ids,
                     }
                     for cid, item in bridge.outbox.items()
                 },
@@ -368,6 +369,7 @@ class ProjectController:
                     else None,
                     request_id=pending.get("request_id"),
                     delivery=pending.get("delivery", "unknown"),
+                    answer_question_ids=pending.get("answer_question_ids", []),
                 )
                 if bridge.delivery_receipts.get(cid, {}).get("state") == "queued":
                     bridge.outbox[cid].error = ""

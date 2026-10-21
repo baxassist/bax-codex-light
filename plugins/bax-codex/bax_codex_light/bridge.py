@@ -41,6 +41,7 @@ class Submission:
     accepted_text: str | None = None
     voice_job_id: str | None = None
     traceparent: str | None = None
+    answer_question_ids: list[str] = field(default_factory=list)
 
     @property
     def preview(self) -> str:
@@ -315,6 +316,8 @@ class Bridge:
         )
 
     async def confirm_submission(self, client_id: str) -> None:
+        if submission := self.outbox.get(client_id):
+            await self.confirm_answers(submission)
         submission = self.outbox.pop(client_id, None)
         if client_id in self.delivery_receipts:
             self.delivery_receipts[client_id]["state"] = "accepted"
@@ -323,6 +326,13 @@ class Bridge:
             code = "delivery_rejected" if submission.delivery == "rejected" else "delivery_uncertain"
             rid = submission.request_id or client_id
             await self.send("error.resolved", error_id=f"run:{rid}:{code}", rid=rid, delivery="accepted")
+
+    async def confirm_answers(self, submission: Submission) -> None:
+        remaining = []
+        for question_id in submission.answer_question_ids:
+            if not await self.send("question.resolved", question_id=question_id, delivery="accepted"):
+                remaining.append(question_id)
+        submission.answer_question_ids = remaining
 
     async def send_history(self, before: int | None = None, limit: int = 50) -> None:
         if not self.history:
@@ -652,6 +662,7 @@ class Bridge:
                                 turn_id=target_turn or self.turn_id,
                             )
                         # После приёма изображение хранит Codex; мост оставляет только метаданные эха.
+                        await self.confirm_answers(submission)
                         submission.images = []
                         log.info(
                             "Codex: сообщение %s принято, ход %s", client_id, target_turn or self.turn_id
@@ -1033,7 +1044,7 @@ class Bridge:
         self.questions.pop(question_id)
         if not any(qid in self.questions for qid in request["question_ids"]):
             self.requests.pop(request_id)
-        await self.send("question.resolved", question_id=question_id)
+        await self.send("question.resolved", question_id=question_id, delivery="accepted")
         await self.show_question()
         return {"question_id": question_id, "resolved": True}
 
@@ -1101,6 +1112,8 @@ class Bridge:
             await self.submit_async_answer(request)
         else:
             await self.app.respond(request_id, result)
+            for answered_id in request["question_ids"]:
+                await self.send("question.resolved", question_id=answered_id, delivery="accepted")
         self.requests.pop(request_id, None)
         for other in request["question_ids"]:
             self.questions.pop(other, None)
@@ -1114,12 +1127,15 @@ class Bridge:
         if len(self.queue) == self.queue.maxlen:
             raise ValueError("Очередь заполнена; дождитесь выполнения задач")
         client_id = str(uuid4())
-        self.outbox[client_id] = Submission(text, steer_allowed=False)
+        submission = Submission(text, steer_allowed=False, answer_question_ids=list(request["question_ids"]))
+        self.outbox[client_id] = submission
+        self.persist_delivery()
         await self.send("message", id=self.history.preview_id(client_id), kind="user", text=text)
         if self.state in {"busy", "waiting"}:
             try:
                 # Ответ идёт в тот ход, который задал вопрос. Другой ход не затрагиваем.
                 await self.app.steer_turn(self.thread_id, request["turn_id"], text, client_id)
+                await self.confirm_answers(submission)
                 return
             except RPCRejected:
                 pass  # Ход уже завершился: обычная очередь того же разговора.

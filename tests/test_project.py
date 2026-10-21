@@ -342,7 +342,12 @@ async def test_resolve_answered_background_question_does_not_select_or_interrupt
         assert (await owner.resolve_question("a", qid))["resolved"]
         assert owner.selected == "b"
         assert not any(c["method"] in {"turn/start", "turn/steer", "turn/interrupt"} for c in fake.calls)
-        assert {"type": "question.resolved", "session": "a", "question_id": qid} in owner.relay.frames
+        assert {
+            "type": "question.resolved",
+            "session": "a",
+            "question_id": qid,
+            "delivery": "accepted",
+        } in owner.relay.frames
 
 
 async def test_background_deltas_and_answers_keep_exact_session(tmp_path):
@@ -544,7 +549,9 @@ async def test_external_archive_keeps_uncertain_delivery(tmp_path):
 async def test_restart_restores_exact_selection_and_does_not_repeat_uncertain_delivery(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
-        owner.sessions["a"].outbox["pending"] = Submission("Сохранённое сообщение")
+        owner.sessions["a"].outbox["pending"] = Submission(
+            "Сохранённое сообщение", answer_question_ids=["answer-a"]
+        )
         owner.sessions["a"].queue.append(("pending", "Сохранённое сообщение"))
         await owner.select("b")
         owner.save()
@@ -553,6 +560,7 @@ async def test_restart_restores_exact_selection_and_does_not_repeat_uncertain_de
         assert saved.selected == "b"
         a = await saved.ensure_session("a")
         assert a.outbox["pending"].text == "Сохранённое сообщение" and a.outbox["pending"].error
+        assert a.outbox["pending"].answer_question_ids == ["answer-a"]
         assert not a.queue
         assert not any(c["method"] in {"turn/start", "turn/steer"} for c in fake.calls)
         assert owner.state_path.stat().st_mode & 0o077 == 0
