@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import os
 import stat
+import sys
 from pathlib import Path
 
 from .files import allowed
@@ -59,6 +60,9 @@ def preview(text: str, image_count: int) -> str:
 def _native_file(raw: str) -> bytes:
     """Только точный localImage из userMessage, без поиска файлов и переходов по symlink."""
     path = Path(raw)
+    # Только штатные системные алиасы macOS; остальные symlink остаются запрещены.
+    if sys.platform == "darwin" and len(path.parts) > 1 and path.parts[1] in {"var", "tmp"}:
+        path = Path("/private").joinpath(*path.parts[1:])
     parts = list(path.parts[1:])
     # Codex хранит выбранные пользователем изображения в своём cache. Это не
     # разрешение читать произвольный .codex: служебные имена всё ещё запрещены.

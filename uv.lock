@@ -40,7 +40,7 @@ wheels = [
 
 [[package]]
 name = "bax-codex-light-agent"
-version = "0.5.24"
+version = "0.5.25"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },

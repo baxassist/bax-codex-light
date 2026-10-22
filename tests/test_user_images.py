@@ -1,4 +1,5 @@
 import base64
+import sys
 from uuid import uuid4
 
 import pytest
@@ -75,6 +76,21 @@ async def test_local_limits_and_native_cache_are_explicit(tmp_path, monkeypatch)
     monkeypatch.setattr(images, "MAX_IMAGE_BYTES", 100)
     monkeypatch.setattr(images, "MAX_TOTAL_BYTES", 8)
     assert "error" in (await images.from_item(item([{"type": "localImage", "path": str(path)}])))[0]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="System alias is macOS-specific")
+async def test_macos_system_var_alias_does_not_allow_arbitrary_symlink(tmp_path):
+    path = tmp_path / "native.png"
+    path.write_bytes(PNG)
+    alias = str(path).removeprefix("/private")
+    picture = (await images.from_item(item([{"type": "localImage", "path": alias}])))[0]
+    assert base64.b64decode(picture["data"]) == PNG
+    linked = tmp_path / "symlink.png"
+    linked.symlink_to(path)
+    picture = (
+        await images.from_item(item([{"type": "localImage", "path": str(linked).removeprefix("/private")}]))
+    )[0]
+    assert "error" in picture and "data" not in picture
 
 
 async def test_live_and_history_user_images_share_native_item_and_request_id(tmp_path):
