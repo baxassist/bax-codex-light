@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .images import preview
+from .images import from_item, preview
 
 
 def identity(item: dict) -> str:
@@ -149,6 +149,12 @@ class History:
                 "text": view[1],
                 "turn_id": entry.get("turnId", ""),
             }
+            if row["kind"] == "user":
+                pictures = await from_item(item)
+                if pictures:
+                    row["images"] = pictures
+                if item.get("clientId"):
+                    row["rid"] = item["clientId"]
             if row["kind"] == "assistant":
                 row.update(metadata.get((entry.get("turnId", ""), item["id"]), {}))
             if item.get("type") == "baxTurnStopped":

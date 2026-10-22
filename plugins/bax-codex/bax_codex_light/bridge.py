@@ -835,6 +835,12 @@ class Bridge:
                 entry_id = self.history.live_id(item_id)
                 # Готовый ответ заменяет потоковую строку с тем же ID.
                 metadata = {}
+                if view[0] == "user":
+                    pictures = await images.from_item(item)
+                    if pictures:
+                        metadata["images"] = pictures
+                    if item.get("clientId"):
+                        metadata["rid"] = item["clientId"]
                 if view[0] == "assistant" and hasattr(self.app, "response_metadata"):
                     turn = params["turnId"]
                     values = await self.app.response_metadata(
