@@ -89,7 +89,7 @@ async def doctor(args) -> dict:
 
 def main() -> None:
     args = parser().parse_args()
-    logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(name)s: %(message)s")
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(asctime)s %(name)s: %(message)s")
     try:
         if not args.project.is_dir():
             raise ValueError("Каталог проекта не существует")

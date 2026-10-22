@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from websockets.asyncio.client import unix_connect
 from websockets.asyncio.server import unix_serve
+from websockets.exceptions import WebSocketException
 
 from . import __version__
 from .appserver import AppServer, RPCError
@@ -136,6 +138,7 @@ class ProjectClient:
         self.error = ""
         self.error_code = ""
         self.task: asyncio.Task | None = None
+        self.ready = asyncio.Event()
 
     async def start(self) -> None:
         # Инициализация MCP не ждёт доступности Codex; required-инструменты готовы сразу.
@@ -147,7 +150,25 @@ class ProjectClient:
         while True:
             await self.discover()
             if not self.error:
-                return
+                self.ready.set()
+                attempt = 0
+                # Постоянное наблюдение за EOF локального канала, без опроса Codex/БД.
+                try:
+                    directory = runtime_path(self.project, self.registry, self.endpoint)
+                    async with unix_connect(
+                        str(directory / "control.sock"),
+                        uri="ws://localhost/",
+                        open_timeout=2,
+                        close_timeout=1,
+                    ) as monitor:
+                        await monitor.wait_closed()
+                except (OSError, TimeoutError, WebSocketException):
+                    pass
+                finally:
+                    self.ready.clear()
+                logging.getLogger(__name__).warning("Контроллер проекта отключился; восстанавливаю связь")
+                await asyncio.sleep(0.1)
+                continue
             if self.error_code == "controller_update_pending":
                 # Это не сетевой сбой: 30-секундная задержка пропускает короткий
                 # промежуток между задачами. Сам владелец проверяет безопасность остановки.
@@ -165,7 +186,7 @@ class ProjectClient:
             await self.ensure_controller()
             self.error = ""
             self.error_code = ""
-        except (RPCError, OSError, TimeoutError, ValueError) as error:
+        except (RPCError, OSError, TimeoutError, ValueError, WebSocketException) as error:
             self.error = str(error)
             self.error_code = "controller_unavailable"
             if isinstance(error, ControllerUpdatePending):
@@ -189,9 +210,25 @@ class ProjectClient:
         if self.project is None:
             raise ValueError("Нужен точный CODEX_THREAD_ID текущего разговора")
         directory = runtime_path(self.project, self.registry, self.endpoint)
+        private_directory(directory)
+        # Один переход на проект: решение по старому статусу не остановит нового владельца.
+        fd = os.open(directory / "transition.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
+            return await self._ensure_controller(directory)
+
+    async def _ensure_controller(self, directory: Path) -> Path:
+        env = {k: v for k, v in os.environ.items() if k not in {"CODEX_THREAD_ID", "BAX_CODEX_THREAD_ID"}}
+        source_path = await asyncio.to_thread(Path(__file__).resolve)
+        env["PYTHONPATH"] = str(source_path.parent.parent)
         try:
             status = await request(directory, "status")
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError, WebSocketException):
             status = None
         if status is not None:
             version = status.get("plugin_version", "")
@@ -202,6 +239,29 @@ class ProjectClient:
                 raise RPCError("Неизвестная версия контроллера; работающий проект сохранён") from error
             if previous >= installed:
                 return directory  # Старое окно MCP не понижает уже обновлённый контроллер.
+            if (
+                status.get("state") in {"busy", "waiting"}
+                or status.get("background_sessions")
+                or any(
+                    status.get(k) for k in ("queued", "unconfirmed", "pending_questions", "delivery_errors")
+                )
+            ):
+                raise ControllerUpdatePending("Контроллер занят; обновление отложено до завершения работы")
+            # Проверяем тот же интерпретатор и импорты до разрыва действующего канала.
+            try:
+                checked = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-c", "from bax_codex_light.controller import serve_controller"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise RPCError("Новая версия не готова; действующий контроллер сохранён") from error
+            if checked.returncode:
+                raise RPCError("Новая версия не готова; действующий контроллер сохранён")
             # Владелец сам проверяет фоновые ходы, доставки и вопросы перед остановкой.
             # Если он занят, auto_discover повторит попытку; связь остаётся у прежнего владельца.
             try:
@@ -216,10 +276,6 @@ class ProjectClient:
                 await asyncio.sleep(0.05)
             else:
                 raise RPCError("Старый контроллер ещё завершает работу; обновление будет повторено")
-        private_directory(directory)
-        env = {k: v for k, v in os.environ.items() if k not in {"CODEX_THREAD_ID", "BAX_CODEX_THREAD_ID"}}
-        source_path = await asyncio.to_thread(Path(__file__).resolve)
-        env["PYTHONPATH"] = str(source_path.parent.parent)
         args = [
             sys.executable,
             "-m",
@@ -284,7 +340,8 @@ class ProjectClient:
                 result["caller_thread_id"] = self.thread_id or None
                 result["needs_thread"] = not self.thread_id or result["thread_id"] != self.thread_id
                 return result
-            except (OSError, TimeoutError, RPCError) as error:
+            except (OSError, TimeoutError, RPCError, WebSocketException) as error:
+                self.ready.clear()
                 self.error = str(error)
                 # Контроллер мог завершиться уже после успешного discovery.
                 # Возобновляем восстановление, сохраняя его выбранную сессию.
@@ -299,7 +356,7 @@ class ProjectClient:
             "mode": "project",
             "connected": False,
             "state": "offline",
-            "needs_thread": True,
+            "needs_thread": not self.thread_id,
             "needs_registration": False,
             "error": self.error,
             "error_code": self.error_code,

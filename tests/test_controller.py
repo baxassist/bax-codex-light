@@ -21,7 +21,7 @@ async def test_two_mcps_share_one_owner_and_eof_keeps_selection(tmp_path):
             await first.bind("a")
             pid = (await first.status())["controller_pid"]
             await second.start()
-            await until(lambda: second.task.done())
+            await asyncio.wait_for(second.ready.wait(), 8)
             assert not second.error
             assert (await second.status())["thread_id"] == "a"  # Новый MCP не выбирает себя автоматически.
             await second.bind("b")
@@ -109,7 +109,7 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
                 fake.threads["a"]["status"] = {"type": "idle"}
                 await fake.emit("thread/status/changed", {"threadId": "a", "status": {"type": "idle"}})
                 await asyncio.wait_for(stopped.wait(), 0.8)
-                await asyncio.wait_for(asyncio.shield(client.task), 8)
+                await asyncio.wait_for(client.ready.wait(), 8)
                 current = await original_request(directory, "status")
                 assert current["controller_pid"] != old_pid
                 assert current["thread_id"] == "a"
@@ -140,7 +140,7 @@ async def test_late_exact_caller_starts_controller_and_preserves_saved_selection
         try:
             await observer.status("b")
             assert observer.task is not None
-            await asyncio.wait_for(asyncio.shield(observer.task), 8)
+            await asyncio.wait_for(observer.ready.wait(), 8)
             result = await observer.status()
             assert result["caller_thread_id"] == "b"
             assert result["thread_id"] == "a"
@@ -159,18 +159,129 @@ async def test_status_recovers_controller_lost_after_completed_start(tmp_path):
     async with fake.running() as endpoint:
         client = ProjectClient(tmp_path, registry, "a", endpoint)
         await client.start()
-        await asyncio.wait_for(asyncio.shield(client.task), 8)
+        await asyncio.wait_for(client.ready.wait(), 8)
         directory = runtime_path(tmp_path, registry, endpoint)
         await client.bind("a")
+        client.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await client.task
         await request(directory, "shutdown")
         await until(lambda: not (directory / "control.sock").exists())
         old_task = client.task
         try:
             await client.status()
             assert client.task is not old_task
-            await asyncio.wait_for(asyncio.shield(client.task), 8)
+            await asyncio.wait_for(client.ready.wait(), 8)
             assert (await client.status())["thread_id"] == "a"
             assert not any(call["method"] == "thread/start" for call in fake.calls)
         finally:
             await client.close()
             await request(directory, "shutdown")
+
+
+async def test_mcp_recovers_lost_owner_without_manual_status_or_reattach(tmp_path, monkeypatch):
+    import contextlib
+
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        client = ProjectClient(tmp_path, registry, "a", endpoint)
+        await client.bind("a")
+        directory = runtime_path(tmp_path, registry, endpoint)
+        old_pid = (await request(directory, "status"))["controller_pid"]
+        discovered = asyncio.Event()
+        original = client.discover
+
+        async def observed():
+            await original()
+            if not client.error:
+                discovered.set()
+
+        monkeypatch.setattr(client, "discover", observed)
+        try:
+            await client.start()
+            await asyncio.wait_for(discovered.wait(), 5)
+            await request(directory, "shutdown")
+            # Read the owner directly: a manual MCP status() must not be what repairs it.
+            async with asyncio.timeout(4):
+                while True:
+                    try:
+                        current = await request(directory, "status")
+                        if current["controller_pid"] != old_pid:
+                            break
+                    except (OSError, RPCError):
+                        pass
+                    await asyncio.sleep(0.02)
+            assert current["thread_id"] == "a"
+            assert not any(call["method"] == "thread/start" for call in fake.calls)
+        finally:
+            await client.close()
+            with contextlib.suppress(OSError, RPCError):
+                await request(directory, "shutdown")
+
+
+async def test_simultaneous_upgrades_replace_owner_only_once(tmp_path, monkeypatch):
+    import bax_codex_light.controller as controller
+
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        first = ProjectClient(tmp_path, registry, "a", endpoint)
+        second = ProjectClient(tmp_path, registry, "b", endpoint)
+        await first.bind("a")
+        directory = runtime_path(tmp_path, registry, endpoint)
+        original = controller.request
+        old_pid = (await original(directory, "status"))["controller_pid"]
+        stopped = []
+
+        async def older(directory, method, **params):
+            result = await original(directory, method, **params)
+            if method == "status" and result["controller_pid"] == old_pid:
+                result["plugin_version"] = "0.4.0"
+            if method == "shutdown":
+                stopped.append(result)
+            return result
+
+        monkeypatch.setattr(controller, "request", older)
+        try:
+            await asyncio.gather(first.ensure_controller(), second.ensure_controller())
+            current = await original(directory, "status")
+            assert current["controller_pid"] != old_pid
+            assert current["thread_id"] == "a"
+            assert len(stopped) == 1
+        finally:
+            await first.close()
+            await second.close()
+            await original(directory, "shutdown")
+
+
+async def test_broken_candidate_cannot_disconnect_previous_owner(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import bax_codex_light.controller as controller
+
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        client = ProjectClient(tmp_path, registry, "a", endpoint)
+        await client.bind("a")
+        directory = runtime_path(tmp_path, registry, endpoint)
+        original = controller.request
+        old_pid = (await original(directory, "status"))["controller_pid"]
+
+        async def older(directory, method, **params):
+            result = await original(directory, method, **params)
+            if method == "status":
+                result["plugin_version"] = "0.4.0"
+            return result
+
+        monkeypatch.setattr(controller, "request", older)
+        monkeypatch.setattr(controller.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=1))
+        try:
+            with pytest.raises(RPCError, match="действующий контроллер сохранён"):
+                await client.ensure_controller()
+            current = await original(directory, "status")
+            assert current["controller_pid"] == old_pid and current["thread_id"] == "a"
+        finally:
+            await client.close()
+            await original(directory, "shutdown")
