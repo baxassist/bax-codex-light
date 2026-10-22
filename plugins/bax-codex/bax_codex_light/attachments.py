@@ -17,7 +17,7 @@ def prepare(project: Path, attachments: object) -> tuple[list[dict], str]:
     if attachments is None or attachments == []:
         return [], ""
     if not isinstance(attachments, list) or len(attachments) > images.MAX_IMAGES:
-        raise ValueError("Можно прикрепить до 8 файлов")
+        raise ValueError("Можно прикрепить до 10 файлов")
     pictures, documents, total = [], [], 0
     for item in attachments:
         if not isinstance(item, dict):

@@ -14,7 +14,7 @@ from pathlib import Path
 from .files import allowed
 from .tracing import dependency
 
-MAX_IMAGES = 8
+MAX_IMAGES = 10
 MAX_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_TOTAL_BYTES = 8 * 1024 * 1024
 
@@ -23,7 +23,7 @@ def inputs(attachments: object) -> list[dict]:
     if attachments is None:
         return []
     if not isinstance(attachments, list) or len(attachments) > MAX_IMAGES:
-        raise ValueError("Можно прикрепить до 8 картинок")
+        raise ValueError("Можно прикрепить до 10 картинок")
     result = []
     total = 0
     for attachment in attachments:

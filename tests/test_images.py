@@ -21,6 +21,24 @@ PHOTO = {"name": "photo.png", "mime": "image/png", "data": PNG}
 INPUT = {"type": "image", "url": "data:image/png;base64," + PNG}
 
 
+async def test_ten_photos_reach_exact_native_turn_without_truncation(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        await owner.on_frame(
+            {
+                "client_id": str(uuid4()),
+                "type": "run",
+                "session": "a",
+                "text": "Сравни",
+                "attachments": [PHOTO] * 10,
+            }
+        )
+        calls = [c for c in fake.calls if c["method"] == "turn/start"]
+        assert len(calls) == 1
+        assert calls[0]["params"]["threadId"] == "a"
+        assert calls[0]["params"]["input"] == [{"type": "text", "text": "Сравни"}] + [INPUT] * 10
+
+
 async def test_image_with_text_and_image_only_use_exact_thread_and_active_turn(tmp_path):
     async with project_controller(tmp_path) as (fake, owner):
         await owner.select("a")
@@ -186,7 +204,7 @@ async def test_rejected_steer_retains_image_until_retry_is_accepted(tmp_path):
         [dict(PHOTO, mime="not-a-mime")],
         [dict(PHOTO, mime=[])],
         [dict(PHOTO, data="A" * (images.MAX_IMAGE_BYTES * 2))],
-        [PHOTO] * 9,
+        [PHOTO] * 11,
         "not a list",
     ],
 )
