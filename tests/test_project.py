@@ -561,6 +561,7 @@ async def test_restart_restores_exact_selection_and_does_not_repeat_uncertain_de
         a = await saved.ensure_session("a")
         assert a.outbox["pending"].text == "Сохранённое сообщение" and a.outbox["pending"].error
         assert a.outbox["pending"].answer_question_ids == ["answer-a"]
+        assert a.outbox["pending"].created_at is not None
         assert not a.queue
         assert not any(c["method"] in {"turn/start", "turn/steer"} for c in fake.calls)
         assert owner.state_path.stat().st_mode & 0o077 == 0

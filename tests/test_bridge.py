@@ -435,3 +435,30 @@ async def test_run_requires_explicit_stable_client_uuid(tmp_path, key):
     failure = b.relay.sent[-1]
     assert failure["type"] == "error" and failure["delivery"] == "rejected"
     assert failure["rid"] == frame["rid"]
+
+
+async def test_live_user_date_preserves_native_correlation_and_images_metadata(tmp_path):
+    b = bridge(tmp_path)
+
+    async def metadata(thread, entries):
+        return {("turn", "user-id"): {"created_at": 1791115200, "model": "not-user"}}
+
+    b.app.response_metadata = metadata
+    await b.on_event(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "current",
+                "turnId": "turn",
+                "item": {
+                    "type": "userMessage",
+                    "id": "user-id",
+                    "clientId": "client-id",
+                    "content": [{"type": "text", "text": "Вопрос"}],
+                },
+            },
+        }
+    )
+    row = next(row for row in b.relay.sent if row["type"] == "message")
+    assert row["created_at"] == 1791115200 and row["rid"] == "client-id"
+    assert "model" not in row

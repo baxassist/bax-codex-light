@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,7 @@ class Submission:
     voice_job_id: str | None = None
     traceparent: str | None = None
     answer_question_ids: list[str] = field(default_factory=list)
+    created_at: float | None = field(default_factory=time.time)
 
     @property
     def preview(self) -> str:
@@ -349,6 +351,7 @@ class Bridge:
                         "id": self.history.preview_id(client_id),
                         "kind": "user",
                         "text": submission.preview,
+                        **({"created_at": submission.created_at} if submission.created_at else {}),
                         "rid": submission.request_id,
                         **(
                             {"accepted_text": submission.accepted_text}
@@ -582,6 +585,7 @@ class Bridge:
                 id=self.history.preview_id(client_id),
                 kind="user",
                 text=submission.preview,
+                created_at=submission.created_at,
                 rid=submission.request_id,
                 **(
                     {"accepted_text": submission.accepted_text}
@@ -841,12 +845,16 @@ class Bridge:
                         metadata["images"] = pictures
                     if item.get("clientId"):
                         metadata["rid"] = item["clientId"]
-                if view[0] == "assistant" and hasattr(self.app, "response_metadata"):
+                if view[0] in {"assistant", "user"} and hasattr(self.app, "response_metadata"):
                     turn = params["turnId"]
                     values = await self.app.response_metadata(
                         self.thread_id, [{"turnId": turn, "item": item}]
                     )
-                    metadata = values.get((turn, item["id"]), {})
+                    detail = values.get((turn, item["id"]), {})
+                    if view[0] == "assistant":
+                        metadata.update(detail)
+                    elif "created_at" in detail:
+                        metadata["created_at"] = detail["created_at"]
                 metadata.setdefault("turn_id", params.get("turnId", ""))
                 await self.send("message", id=entry_id, kind=view[0], text=view[1], **metadata)
                 self.streamed.add(item["id"])
@@ -1136,7 +1144,13 @@ class Bridge:
         submission = Submission(text, steer_allowed=False, answer_question_ids=list(request["question_ids"]))
         self.outbox[client_id] = submission
         self.persist_delivery()
-        await self.send("message", id=self.history.preview_id(client_id), kind="user", text=text)
+        await self.send(
+            "message",
+            id=self.history.preview_id(client_id),
+            kind="user",
+            text=text,
+            created_at=submission.created_at,
+        )
         if self.state in {"busy", "waiting"}:
             try:
                 # Ответ идёт в тот ход, который задал вопрос. Другой ход не затрагиваем.

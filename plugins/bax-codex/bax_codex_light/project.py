@@ -176,6 +176,7 @@ class ProjectController:
                         if bridge.delivery_receipts.get(cid, {}).get("state") == "queued"
                         else [],
                         "accepted_text": item.accepted_text,
+                        "created_at": item.created_at,
                         "voice_job_id": item.voice_job_id,
                         "traceparent": item.traceparent,
                         "request_id": item.request_id,
@@ -363,6 +364,7 @@ class ProjectController:
                     image_count=pending.get("image_count", 0),
                     images=pending.get("images", []),
                     accepted_text=pending.get("accepted_text"),
+                    created_at=pending.get("created_at"),
                     voice_job_id=pending.get("voice_job_id"),
                     traceparent=pending.get("traceparent")
                     if valid_parent(pending.get("traceparent"))

@@ -179,3 +179,71 @@ def test_compaction_without_measurement_is_unknown_and_naive_time_is_rejected(tm
     metadata.refresh()
     assert len(metadata.compactions) == 1
     assert metadata.compactions[0]["before"] is metadata.compactions[0]["after"] is None
+
+
+def user_entry(turn, item_id, text="Вопрос"):
+    return {
+        "turnId": turn,
+        "item": {"id": item_id, "type": "userMessage", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def test_user_original_time_by_id_survives_turn_context_order_and_restart(tmp_path):
+    path, metadata = fixture(tmp_path)
+    row = {
+        "type": "response_item",
+        "timestamp": "2026-10-04T12:00:00Z",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "id": "user-id",
+            "content": [{"type": "input_text", "text": "Вопрос"}],
+        },
+    }
+    with path.open("a") as file:
+        file.write(json.dumps(row) + "\n")
+    append(path, "turn", "assistant-model", item_id="assistant-id")
+    key = ("turn", "user-id")
+    result = metadata.decorate([user_entry(*key)])[key]
+    assert result["created_at"] == 1791115200
+    assert "model" not in result and "effort" not in result
+    assert metadata.live(user_entry(*key)["item"], "turn") == result
+    assert (
+        ResponseMetadata({"id": "exact", "cwd": str(tmp_path), "path": str(path)}, tmp_path).decorate(
+            [user_entry(*key)]
+        )[key]
+        == result
+    )
+
+
+def test_repeated_user_text_is_role_scoped_and_partial_history_never_guesses_time(tmp_path):
+    path, metadata = fixture(tmp_path)
+    append(path, "turn", "model", text="Вопрос")
+    with path.open("a") as file:
+        for stamp in ("2026-10-04T12:01:00Z", "2026-10-04T12:02:00Z"):
+            file.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "timestamp": stamp,
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Вопрос"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+    full = metadata.decorate([user_entry("turn", "one"), user_entry("turn", "two")])
+    assert full[("turn", "two")]["created_at"] - full[("turn", "one")]["created_at"] == 60
+    partial = metadata.decorate([user_entry("turn", "one")])[("turn", "one")]
+    assert "created_at" not in partial and "model" not in partial
+    assert metadata.decorate([entry("turn", text="Вопрос")])[("turn", "legacy")]["model"] == "model"
+
+
+def test_user_sdk_start_time_is_not_replaced_by_completion_time(tmp_path):
+    _, metadata = fixture(tmp_path)
+    value = user_entry("turn", "user")
+    value.update(startedAtMs=1791115200000, completedAtMs=1791115205000)
+    assert metadata.decorate([value])[("turn", "user")]["created_at"] == 1791115200

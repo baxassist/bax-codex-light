@@ -171,3 +171,18 @@ async def test_overlapping_pages_do_not_duplicate_messages():
     )
     rows = await History(pages, "current").page(limit=50)
     assert [r["text"] for r in rows] == ["old", "overlap", "latest"]
+
+
+async def test_user_date_is_forwarded_without_assistant_parameters():
+    pages = Pages({None: {"data": [entry("u", "userMessage")], "nextCursor": None}})
+
+    async def metadata(thread, entries):
+        return {
+            (row["turnId"], row["item"]["id"]): {"created_at": 1791115200, "model": "wrong-for-user"}
+            for row in entries
+        }
+
+    pages.response_metadata = metadata
+    rows = await History(pages, "current").page()
+    assert rows[0]["created_at"] == 1791115200
+    assert "model" not in rows[0]

@@ -16,9 +16,15 @@ from pathlib import Path
 
 
 def fingerprint(item: dict, turn_id: str) -> tuple | None:
-    if item.get("type") != "agentMessage" or not item.get("text"):
+    role = {"agentMessage": "assistant", "userMessage": "user"}.get(item.get("type"))
+    text = (
+        item.get("text", "")
+        if role == "assistant"
+        else "".join(part.get("text", "") for part in item.get("content", []) if part.get("type") == "text")
+    )
+    if not role or not text:
         return None
-    return turn_id, item.get("phase"), hashlib.sha256(item["text"].encode()).hexdigest()
+    return turn_id, role, item.get("phase"), hashlib.sha256(text.encode()).hexdigest()
 
 
 class ResponseMetadata:
@@ -122,14 +128,19 @@ class ResponseMetadata:
         elif (
             kind == "response_item"
             and payload.get("type") == "message"
-            and payload.get("role") == "assistant"
+            and payload.get("role") in {"assistant", "user"}
         ):
             text = "".join(
                 part.get("text", "") for part in payload.get("content", []) if isinstance(part, dict)
             )
-            if not text or not self.context:
+            role = payload["role"]
+            if role == "assistant" and (not text or not self.context):
                 return
-            metadata = dict(self.context)
+            # ID пользователя однозначен в проверенном журнале даже до turn_context.
+            metadata = (
+                dict(self.context) if role == "assistant" else {"turn_id": self.context.get("turn_id", "")}
+            )
+            metadata["role"] = role
             try:
                 stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
                 if stamp.tzinfo is not None:
@@ -141,7 +152,7 @@ class ResponseMetadata:
                 if item_id in self.by_id:
                     return
                 self.by_id[item_id] = metadata
-            key = self.context["turn_id"], payload.get("phase"), hashlib.sha256(text.encode()).hexdigest()
+            key = metadata["turn_id"], role, payload.get("phase"), hashlib.sha256(text.encode()).hexdigest()
             self.by_fingerprint[key].append(metadata)
 
     def decorate(self, entries: list[dict]) -> dict[tuple[str, str], dict]:
@@ -152,12 +163,17 @@ class ResponseMetadata:
             item, turn = entry["item"], entry["turnId"]
             key = turn, item["id"]
             if metadata := self.by_id.get(item["id"]):
-                if metadata["turn_id"] == turn:
-                    result[key] = dict(metadata)
+                role = "user" if item.get("type") == "userMessage" else "assistant"
+                if metadata.get("role") == role and (role == "user" or metadata["turn_id"] == turn):
+                    result[key] = {k: v for k, v in metadata.items() if k != "role"}
             elif value := fingerprint(item, turn):
                 groups[value].append(key)
             # В paginated API время элемента известно независимо от журнала.
-            stamp = entry.get("completedAtMs") or entry.get("startedAtMs")
+            stamp = (
+                (entry.get("startedAtMs") or entry.get("completedAtMs"))
+                if item.get("type") == "userMessage"
+                else (entry.get("completedAtMs") or entry.get("startedAtMs"))
+            )
             if isinstance(stamp, (int, float)) and stamp > 0:
                 result.setdefault(key, {})["created_at"] = stamp / 1000
         for value, keys in groups.items():
@@ -166,11 +182,18 @@ class ResponseMetadata:
                 # entries идут от раннего к позднему. Полная legacy-пачка хода
                 # позволяет различить даже одинаковые ответы с разным временем.
                 for key, metadata in zip(keys, candidates, strict=True):
-                    result[key] = {**metadata, **result.get(key, {})}
+                    result[key] = {
+                        **{k: v for k, v in metadata.items() if k != "role"},
+                        **result.get(key, {}),
+                    }
             elif candidates:
                 # Неполное/неоднозначное совпадение: только одинаковые параметры,
                 # время и модель соседнего ответа угадывать нельзя.
-                common = {k: v for k, v in candidates[0].items() if all(c.get(k) == v for c in candidates)}
+                common = {
+                    k: v
+                    for k, v in candidates[0].items()
+                    if k != "role" and all(c.get(k) == v for c in candidates)
+                }
                 for key in keys:
                     result[key] = {**common, **result.get(key, {})}
         return result

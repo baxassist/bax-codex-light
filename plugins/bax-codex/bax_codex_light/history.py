@@ -155,8 +155,11 @@ class History:
                     row["images"] = pictures
                 if item.get("clientId"):
                     row["rid"] = item["clientId"]
+            detail = metadata.get((entry.get("turnId", ""), item["id"]), {})
             if row["kind"] == "assistant":
-                row.update(metadata.get((entry.get("turnId", ""), item["id"]), {}))
+                row.update(detail)
+            elif row["kind"] == "user" and "created_at" in detail:
+                row["created_at"] = detail["created_at"]
             if item.get("type") == "baxTurnStopped":
                 row["event"] = "stopped"
                 if entry.get("created_at"):
