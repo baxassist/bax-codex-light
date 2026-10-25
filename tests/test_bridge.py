@@ -462,3 +462,86 @@ async def test_live_user_date_preserves_native_correlation_and_images_metadata(t
     row = next(row for row in b.relay.sent if row["type"] == "message")
     assert row["created_at"] == 1791115200 and row["rid"] == "client-id"
     assert "model" not in row
+
+
+async def test_completed_reply_gets_own_metadata_after_delayed_rollout_flush(tmp_path):
+    b = bridge(tmp_path)
+    ready = asyncio.Event()
+
+    async def metadata(thread, entries):
+        if not ready.is_set():
+            return {}
+        value = entries[0]
+        return {
+            (value["turnId"], value["item"]["id"]): {
+                "model": "original-model",
+                "effort": "high",
+                "created_at": 1792958208.913,
+            }
+        }
+
+    b.app.response_metadata = metadata
+    b.metadata_retry_delays = (0.01, 0.02, 0.02)
+    await b.on_event(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "current",
+                "turnId": "own-turn",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "answer",
+                    "phase": "final_answer",
+                    "text": "Готовый ответ",
+                },
+            },
+        }
+    )
+    original = next(row for row in b.relay.sent if row["type"] == "message")
+    assert "created_at" not in original
+    ready.set()
+    for _ in range(40):
+        frames = [row for row in b.relay.sent if row["type"] == "message" and row.get("created_at")]
+        if frames:
+            break
+        await asyncio.sleep(0.01)
+    assert len(frames) == 1
+    assert frames[0]["id"] == original["id"] and frames[0]["text"] == original["text"]
+    assert frames[0]["model"] == "original-model" and frames[0]["effort"] == "high"
+    assert frames[0]["created_at"] == 1792958208.913
+    assert not b.app.calls  # Never execute/restart the model just to get a caption.
+
+
+async def test_late_reply_metadata_cannot_cross_reconnected_source(tmp_path):
+    b = bridge(tmp_path)
+    entered, ready = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def metadata(thread, entries):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {}
+        entered.set()
+        await ready.wait()
+        return {("turn", "answer"): {"model": "old-source", "created_at": 1792958208.913}}
+
+    b.app.response_metadata = metadata
+    b.metadata_retry_delays = (0.001,)
+    await b.on_event(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "current",
+                "turnId": "turn",
+                "item": {"type": "agentMessage", "id": "answer", "text": "Готовый ответ"},
+            },
+        }
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 0.25)
+        b.history = History(b.app, "replacement")
+    finally:
+        ready.set()
+    await asyncio.sleep(0.02)
+    assert not any(row.get("model") == "old-source" for row in b.relay.sent)

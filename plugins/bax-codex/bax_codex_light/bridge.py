@@ -80,6 +80,9 @@ class Bridge:
         self.delivery_receipts: dict[str, dict] = {}
         self.turn_id = ""
         self.streamed: set[str] = set()
+        self.metadata_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self.metadata_retry_delays = (0.05, 0.2, 0.75, 2.0, 5.0)
+        self.metadata_stopped = False
         self.seen_async_questions: set[str] = set()
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
@@ -131,6 +134,7 @@ class Bridge:
         if self.task is not None and self.task.done():
             self.task = None
         if self.thread_id and self.task is None:
+            self.metadata_stopped = False
             self.task = asyncio.create_task(self._run(), name="bax-bridge")
 
     async def bind(self, thread_id: str) -> dict:
@@ -232,6 +236,7 @@ class Bridge:
                 self.project_ready.set()
                 log.warning("%s (код: %s)", safe_message(self.error), self.error_code)
             finally:
+                await self.cancel_metadata_tasks()
                 self.questions.clear()
                 self.requests.clear()
                 if relay_task:
@@ -746,6 +751,71 @@ class Bridge:
                                 self._set_state(thread["status"])
                                 await self.send("status", state=self.state)
 
+    async def cancel_metadata_tasks(self) -> None:
+        tasks = list(self.metadata_tasks.values())
+        self.metadata_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def refresh_reply_metadata(self, item: dict, turn: str, entry_id: int, text: str, known: dict) -> None:
+        """item/completed может опережать flush журнала; повтор не блокирует команды."""
+        if self.metadata_stopped or not self.app or not hasattr(self.app, "response_metadata"):
+            return
+        if known.get("model") and known.get("created_at"):
+            return
+        # Ограниченный хвост обычных ответов; большие ответы доступны через историю.
+        if len(text.encode()) > 128 * 1024:
+            return
+        key = self.thread_id, item["id"]
+        if previous := self.metadata_tasks.pop(key, None):
+            previous.cancel()
+        if len(self.metadata_tasks) >= 16:
+            oldest = self.metadata_tasks.pop(next(iter(self.metadata_tasks)))
+            oldest.cancel()
+        app, history, relay, thread = self.app, self.history, self.relay, self.thread_id
+        source = {key: item[key] for key in ("id", "type", "text", "phase") if key in item}
+
+        def current() -> bool:
+            return (
+                not self.metadata_stopped
+                and self.app is app
+                and self.history is history
+                and self.relay is relay
+                and self.thread_id == thread
+                and history is not None
+                and history.ids.get(identity(source)) == entry_id
+            )
+
+        async def refresh() -> None:
+            previous = dict(known)
+            try:
+                for delay in self.metadata_retry_delays:
+                    await asyncio.sleep(delay)
+                    if not current():
+                        return
+                    values = await app.response_metadata(thread, [{"turnId": turn, "item": source}])
+                    if not current():
+                        return
+                    detail = values.get((turn, item["id"]), {})
+                    if detail and any(previous.get(field) != value for field, value in detail.items()):
+                        sent = await self.send(
+                            "message", id=entry_id, kind="assistant", text=text, **{**detail, "turn_id": turn}
+                        )
+                        if sent:
+                            previous.update(detail)
+                    if previous.get("model") and previous.get("created_at"):
+                        return
+            except Exception as error:
+                # Диагностика метаданных не меняет выполнение запроса и не раскрывает текст.
+                log.warning("Не удалось дочитать подпись ответа: %s", type(error).__name__)
+            finally:
+                if self.metadata_tasks.get(key) is asyncio.current_task():
+                    self.metadata_tasks.pop(key, None)
+
+        self.metadata_tasks[key] = asyncio.create_task(refresh(), name="bax-reply-metadata")
+
     async def on_event(self, event: dict) -> None:
         params = event.get("params", {})
         turn_id = params.get("turnId") or params.get("turn", {}).get("id")
@@ -858,6 +928,8 @@ class Bridge:
                 metadata.setdefault("turn_id", params.get("turnId", ""))
                 await self.send("message", id=entry_id, kind=view[0], text=view[1], **metadata)
                 self.streamed.add(item["id"])
+                if method == "item/completed" and view[0] == "assistant" and params.get("turnId"):
+                    self.refresh_reply_metadata(item, params["turnId"], entry_id, view[1], metadata)
         elif method == "item/agentMessage/delta" and self.history:
             item_id = params["itemId"]
             entry_id = self.history.live_id(item_id)
@@ -1174,6 +1246,8 @@ class Bridge:
         await self._drain()
 
     async def close(self) -> None:
+        self.metadata_stopped = True
+        await self.cancel_metadata_tasks()
         if self.task:
             self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
