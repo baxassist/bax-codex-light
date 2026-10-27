@@ -233,8 +233,8 @@ codex plugin add bax-codex@baxassist
 ```
 
 Затем применить её в работающем Codex: через существующий локальный AppServer
-последовательно вызвать `plugin/reconcile`, затем `config/mcpServer/reload`
-с `params: null`. Это RPC-методы AppServer, а не команды терминала. Установка
+последовательно вызвать `plugin/reconcile` с `params: {}` (тип PluginReconcileParams),
+затем `config/mcpServer/reload` с `params: null`. Это RPC-методы AppServer, а не команды терминала. Установка
 через CLI сама по себе не заменяет уже запущенные MCP-процессы. Горячая
 перезагрузка проверена на Codex 0.160.0; для обновления перезапуск Codex не нужен.
 
