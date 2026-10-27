@@ -603,7 +603,7 @@ async def test_subscribe_recovers_dense_history_without_changing_thread_or_permi
             return {"data": [entry("right"), entry("missing"), entry("left")], "nextCursor": None}
 
         bridge.app.items = items
-        bridge.history.ids = {"left": 100, "right": 101}
+        bridge.history.ids = {("turn", "left"): 100, ("turn", "right"): 101}
         bridge.history.low, bridge.history.high = 100, 101
         owner.relay.frames.clear()
         fake.calls.clear()
@@ -631,7 +631,12 @@ async def test_reopen_recovers_older_page_conflict_without_starting_a_turn(tmp_p
             }
 
         bridge.app.items = items
-        bridge.history.ids = {"old-left": 200, "old-right": 100, "latest-left": 300, "latest-right": 400}
+        bridge.history.ids = {
+            ("turn", "old-left"): 200,
+            ("turn", "old-right"): 100,
+            ("turn", "latest-left"): 300,
+            ("turn", "latest-right"): 400,
+        }
         bridge.history.low, bridge.history.high = 100, 400
         bridge.history.initialized = True
         fake.calls.clear()

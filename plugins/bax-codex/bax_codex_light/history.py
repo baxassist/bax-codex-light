@@ -10,8 +10,14 @@ from .images import from_item, preview
 log = logging.getLogger(__name__)
 
 
-def identity(item: dict) -> str:
+def submission_key(item: dict) -> str:
+    """Ключ подтверждения отправки; не идентичность строки истории."""
     return item.get("clientId") or item["id"]
+
+
+def message_key(turn_id: str, item_id: str) -> tuple[str, str]:
+    """Идентичность внутри точного разговора, общая для истории и live-событий."""
+    return turn_id, item_id
 
 
 def stopped_entry(turn: dict) -> dict | None:
@@ -64,7 +70,7 @@ class History:
     def __init__(self, app: Any, thread_id: str):
         self.app = app
         self.thread_id = thread_id
-        self.ids: dict[str, int] = {}
+        self.ids: dict[tuple[str, str], int] = {}
         self.previews: dict[str, int] = {}
         self.recorded: set[str] = set()
         self.low = self.high = 1 << 40
@@ -72,15 +78,17 @@ class History:
         self.cursors: dict[int, str | None] = {}
         self.rebase_on_reload = False
 
-    def live_id(self, item_id: str) -> int:
-        if item_id not in self.ids:
-            if item_id in self.previews:
-                self.ids[item_id] = self.previews.pop(item_id)
-                self.high = max(self.high, self.ids[item_id])
+    def live_id(self, item_id: str, turn_id: str, *, client_id: str | None = None) -> int:
+        # Native item ID уникален только внутри хода. Объект History — внутри разговора.
+        key = message_key(turn_id, item_id)
+        if key not in self.ids:
+            if client_id in self.previews:
+                self.ids[key] = self.previews.pop(client_id)
+                self.high = max(self.high, self.ids[key])
             else:
                 self.high += 1 << 20
-                self.ids[item_id] = self.high
-        return self.ids[item_id]
+                self.ids[key] = self.high
+        return self.ids[key]
 
     def preview_id(self, client_id: str) -> int:
         """Эхо очереди ещё не задаёт позицию сообщения в настоящей истории Codex."""
@@ -110,18 +118,19 @@ class History:
         # Страницы могут перекрываться, если между запросами добавились события.
         unique, seen = [], set()
         for entry in entries:
-            item_id = identity(entry["item"])
+            item_id = message_key(entry["turnId"], entry["item"]["id"])
             if item_id not in seen:
                 unique.append(entry)
                 seen.add(item_id)
         entries = list(reversed(unique))
-        chronological = [identity(entry["item"]) for entry in entries]
+        chronological = [message_key(entry["turnId"], entry["item"]["id"]) for entry in entries]
         self.recorded.update(
-            identity(entry["item"]) for entry in entries if entry["item"].get("type") == "userMessage"
+            submission_key(entry["item"]) for entry in entries if entry["item"].get("type") == "userMessage"
         )
-        for item_id in chronological:
-            if item_id in self.previews:
-                self.live_id(item_id)
+        for entry in entries:
+            item = entry["item"]
+            if item.get("clientId") in self.previews:
+                self.live_id(item["id"], entry["turnId"], client_id=item["clientId"])
         if before is None and self.rebase_on_reload:
             self._rebase()
         try:
@@ -151,7 +160,7 @@ class History:
             if view is None or not view[1]:
                 continue
             row = {
-                "id": self.ids[identity(item)],
+                "id": self.ids[message_key(entry["turnId"], item["id"])],
                 "kind": view[0],
                 "text": view[1],
                 "turn_id": entry.get("turnId", ""),
@@ -189,7 +198,7 @@ class History:
         self.cursors = {}
         self.rebase_on_reload = False
 
-    def _assign(self, chronological: list[str], *, newest: bool) -> None:
+    def _assign(self, chronological: list[tuple[str, str]], *, newest: bool) -> None:
         """Вставка пропущенных элементов между известными, без изменения старых ID."""
         ids = dict(self.ids)
         known = [ids[item_id] for item_id in chronological if item_id in ids]

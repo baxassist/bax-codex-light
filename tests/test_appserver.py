@@ -7,7 +7,10 @@ from bax_codex_light.appserver import AppServer, RPCError, RPCRejected
 from bax_codex_light.history import History
 
 
-async def test_legacy_history_falls_back_to_native_turn_pages_in_chronological_order(tmp_path):
+@pytest.mark.parametrize("reuse_item_ids", [False, True])
+async def test_legacy_history_falls_back_to_native_turn_pages_in_chronological_order(
+    tmp_path, reuse_item_ids
+):
     fake = FakeApp(tmp_path)
     fake.items_error = "thread/items/list is not supported yet"
     fake.turn_pages = {
@@ -38,6 +41,11 @@ async def test_legacy_history_falls_back_to_native_turn_pages_in_chronological_o
             "nextCursor": None,
         },
     }
+    if reuse_item_ids:
+        for page in fake.turn_pages.values():
+            for turn in page["data"]:
+                for index, item in enumerate(turn["items"]):
+                    item["id"] = f"item-{index}"
     async with fake.running() as endpoint:
         app = AppServer(endpoint)
         await app.open()
@@ -51,7 +59,7 @@ async def test_legacy_history_falls_back_to_native_turn_pages_in_chronological_o
                 "Новый ответ",
             ]
             assert [row["id"] for row in rows] == sorted(row["id"] for row in rows)
-            assert history.recorded == {"user-old", "user-new"}
+            assert history.recorded == ({"item-0"} if reuse_item_ids else {"user-old", "user-new"})
             assert not await history.page(before=rows[0]["id"])
             assert len([c for c in fake.calls if c["method"] == "thread/items/list"]) == 1
             turns = [c["params"] for c in fake.calls if c["method"] == "thread/turns/list"]

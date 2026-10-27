@@ -19,7 +19,7 @@ from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .errors import failure_fields, safe_message
-from .history import History, identity, render, stopped_entry
+from .history import History, message_key, render, stopped_entry, submission_key
 from .preferences import Preferences
 from .registry import Registration, Registry
 from .tracing import command_context, valid_parent
@@ -79,8 +79,8 @@ class Bridge:
         self.turn_traces: dict[str, str] = {}
         self.delivery_receipts: dict[str, dict] = {}
         self.turn_id = ""
-        self.streamed: set[str] = set()
-        self.metadata_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self.streamed: set[tuple[str, str]] = set()
+        self.metadata_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
         self.metadata_retry_delays = (0.05, 0.2, 0.75, 2.0, 5.0)
         self.metadata_stopped = False
         self.seen_async_questions: set[str] = set()
@@ -768,7 +768,7 @@ class Bridge:
         # Ограниченный хвост обычных ответов; большие ответы доступны через историю.
         if len(text.encode()) > 128 * 1024:
             return
-        key = self.thread_id, item["id"]
+        key = self.thread_id, turn, item["id"]
         if previous := self.metadata_tasks.pop(key, None):
             previous.cancel()
         if len(self.metadata_tasks) >= 16:
@@ -785,7 +785,7 @@ class Bridge:
                 and self.relay is relay
                 and self.thread_id == thread
                 and history is not None
-                and history.ids.get(identity(source)) == entry_id
+                and history.ids.get(message_key(turn, source["id"])) == entry_id
             )
 
         async def refresh() -> None:
@@ -865,7 +865,7 @@ class Bridge:
                 stamp = marker.get("created_at")
                 await self.send(
                     "message",
-                    id=self.history.live_id(marker["item"]["id"]),
+                    id=self.history.live_id(marker["item"]["id"], turn["id"]),
                     kind="event",
                     event="stopped",
                     text="Работа остановлена",
@@ -897,7 +897,7 @@ class Bridge:
                 await self.async_questions(item, params["turnId"])
             view = render(item)
             if view and view[1]:
-                item_id = identity(item)
+                item_id = submission_key(item)
                 if item.get("type") == "userMessage":
                     await self.resolve_structured_answers(view[1])
                     self.history.recorded.add(item_id)
@@ -906,7 +906,7 @@ class Bridge:
                         # Дополнительное подтверждение привязано к UUID команды телефона.
                         await self.send("error.resolved", rid=pending.request_id, delivery="accepted")
                     await self.confirm_submission(item_id)
-                entry_id = self.history.live_id(item_id)
+                entry_id = self.history.live_id(item["id"], params["turnId"], client_id=item.get("clientId"))
                 # Готовый ответ заменяет потоковую строку с тем же ID.
                 metadata = {}
                 if view[0] == "user":
@@ -927,13 +927,13 @@ class Bridge:
                         metadata["created_at"] = detail["created_at"]
                 metadata.setdefault("turn_id", params.get("turnId", ""))
                 await self.send("message", id=entry_id, kind=view[0], text=view[1], **metadata)
-                self.streamed.add(item["id"])
+                self.streamed.add(message_key(params["turnId"], item["id"]))
                 if method == "item/completed" and view[0] == "assistant" and params.get("turnId"):
                     self.refresh_reply_metadata(item, params["turnId"], entry_id, view[1], metadata)
         elif method == "item/agentMessage/delta" and self.history:
             item_id = params["itemId"]
-            entry_id = self.history.live_id(item_id)
-            self.streamed.add(item_id)
+            entry_id = self.history.live_id(item_id, params["turnId"])
+            self.streamed.add(message_key(params["turnId"], item_id))
             await self.send("delta", id=entry_id, chunk=params["delta"], turn_id=params.get("turnId", ""))
         elif method == "serverRequest/resolved":
             request_id = params.get("requestId")

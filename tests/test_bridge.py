@@ -82,6 +82,49 @@ def bridge(tmp_path):
     return result
 
 
+async def test_live_reused_item_id_updates_only_its_turn_and_matches_history(tmp_path):
+    b = bridge(tmp_path)
+    b.metadata_retry_delays = ()
+    try:
+        for turn, text in [("old", "Старый ответ"), ("new", "Новый ответ")]:
+            await b.on_event(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"threadId": "current", "turnId": turn, "itemId": "item-2", "delta": text},
+                }
+            )
+            await b.on_event(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "current",
+                        "turnId": turn,
+                        "item": {"id": "item-2", "type": "agentMessage", "text": text},
+                    },
+                }
+            )
+        sent = [frame for frame in b.relay.sent if frame["type"] in {"delta", "message"}]
+        assert sent[0]["id"] == sent[1]["id"] < sent[2]["id"] == sent[3]["id"]
+
+        async def items(thread, cursor, limit):
+            return {
+                "data": [
+                    {"turnId": turn, "item": {"id": "item-2", "type": "agentMessage", "text": text}}
+                    for turn, text in [("new", "Новый ответ"), ("old", "Старый ответ")]
+                ],
+                "nextCursor": None,
+            }
+
+        b.app.items = items
+        rows = await b.history.page()
+        assert [(row["id"], row["text"]) for row in rows] == [
+            (sent[1]["id"], "Старый ответ"),
+            (sent[3]["id"], "Новый ответ"),
+        ]
+    finally:
+        await b.cancel_metadata_tasks()
+
+
 async def test_missing_active_turn_id_queues_then_delivers_backlog_in_one_turn(tmp_path):
     b = bridge(tmp_path)
     await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "первое"})
@@ -177,7 +220,12 @@ async def test_late_native_confirmation_removes_uncertainty_without_retry(tmp_pa
     native = entry("native", "userMessage", "мой вопрос")
     native["item"]["clientId"] = client_id
 
-    await b.on_event({"method": "item/completed", "params": {"threadId": "current", "item": native["item"]}})
+    await b.on_event(
+        {
+            "method": "item/completed",
+            "params": {"threadId": "current", "turnId": "turn", "item": native["item"]},
+        }
+    )
     confirmation = [frame for frame in b.relay.sent if frame["type"] == "message"][-1]
     assert confirmation["id"] == echo["id"]
     assert any(f["type"] == "error.resolved" and f.get("delivery") == "accepted" for f in b.relay.sent)
@@ -200,7 +248,12 @@ async def test_queued_echo_does_not_break_history_after_active_answer(tmp_path):
     await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "вопрос в очереди"})
     client_id = b.queue[0][0]
     answer = entry("active-answer")
-    await b.on_event({"method": "item/completed", "params": {"threadId": "current", "item": answer["item"]}})
+    await b.on_event(
+        {
+            "method": "item/completed",
+            "params": {"threadId": "current", "turnId": "turn", "item": answer["item"]},
+        }
+    )
     b.app.state = "idle"
     await b._drain()
     native = entry("native-question", "userMessage", "вопрос в очереди")
@@ -350,6 +403,7 @@ async def test_stream_does_not_emit_empty_duplicate_row(tmp_path):
             "params": {
                 "threadId": "current",
                 "item": {"type": "agentMessage", "id": "answer", "text": "Привет"},
+                "turnId": "turn",
             },
         }
     )

@@ -37,7 +37,7 @@ async def test_stopped_history_restores_partial_answer_and_one_stable_status(tmp
             assert status["kind"] == "event" and status["event"] == "stopped"
             assert status["turn_id"] == "turn" and status["created_at"] == 123
             assert await history.page(limit=2) == rows
-            assert history.live_id("bax:stopped:turn") == status["id"]
+            assert history.live_id("bax:stopped:turn", "turn") == status["id"]
             restored = await History(app, "current").page(limit=2)
             assert restored[-1] == status
             if not native:
@@ -71,7 +71,7 @@ async def test_native_page_boundary_does_not_put_stop_in_middle_of_answer(tmp_pa
 @pytest.mark.parametrize("status", ["completed", "failed", "interrupted"])
 async def test_live_outcome_is_confirmed_by_codex_and_repeated_event_uses_same_id(tmp_path, status):
     b = bridge(tmp_path)
-    b.history.live_id("partial")
+    b.history.live_id("partial", "turn")
     event = {
         "method": "turn/completed",
         "params": {"threadId": "current", "turn": {"id": "turn", "status": status, "completedAt": 123}},
@@ -82,7 +82,7 @@ async def test_live_outcome_is_confirmed_by_codex_and_repeated_event_uses_same_i
     if status == "interrupted":
         assert len(markers) == 2 and markers[0] == markers[1]
         assert markers[0]["created_at"] == 123
-        assert markers[0]["id"] > b.history.ids["partial"]
+        assert markers[0]["id"] > b.history.ids[("turn", "partial")]
     else:
         assert not markers
     assert b.relay.sent[-1]["type"] == "done" and b.relay.sent[-1]["status"] == status

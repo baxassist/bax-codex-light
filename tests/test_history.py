@@ -14,6 +14,30 @@ class Pages:
         return self.pages[cursor]
 
 
+@pytest.mark.parametrize("separate_pages", [False, True])
+async def test_reused_native_item_ids_in_different_turns_keep_all_messages(separate_pages):
+    def turn(name):
+        return [
+            {**entry("item-2", text=f"Ответ {name}"), "turnId": name},
+            {**entry("item-1", "userMessage", f"Задача {name}"), "turnId": name},
+        ]
+
+    pages = Pages(
+        {None: {"data": turn("new"), "nextCursor": "old"}, "old": {"data": turn("old"), "nextCursor": None}}
+    )
+    history = History(pages, "current")
+    if separate_pages:
+        newest = await history.page(limit=2)
+        older = await history.page(newest[0]["id"], 2)
+        assert max(row["id"] for row in older) < min(row["id"] for row in newest)
+        rows = older + newest
+    else:
+        rows = await history.page()
+    assert [row["text"] for row in rows] == ["Задача old", "Ответ old", "Задача new", "Ответ new"]
+    assert [row["id"] for row in rows] == sorted({row["id"] for row in rows})
+    assert await history.page(rows[0]["id"]) == []
+
+
 async def test_pagination_is_stable_and_steps_folded():
     pages = Pages(
         {
@@ -49,9 +73,9 @@ async def test_missing_new_items_after_reconnect_keep_chronological_ids():
     pages.pages[None]["data"] = [entry("new"), entry("a"), entry("insert"), entry("u", "userMessage")]
     updated = await history.page()
     assert [r["id"] for r in updated] == sorted(r["id"] for r in updated)
-    assert history.ids["a"] == initial[-1]["id"]
-    assert history.ids["u"] == initial[0]["id"]
-    assert history.live_id("new") == updated[-1]["id"]
+    assert history.ids[("turn", "a")] == initial[-1]["id"]
+    assert history.ids[("turn", "u")] == initial[0]["id"]
+    assert history.live_id("new", "turn") == updated[-1]["id"]
 
 
 async def test_async_questions_without_text_survive_history_reload():
@@ -64,7 +88,7 @@ async def test_async_questions_without_text_survive_history_reload():
             {"title": "Как назвать проект?"},
         ],
     }
-    pages = Pages({None: {"data": [{"item": item}], "nextCursor": None}})
+    pages = Pages({None: {"data": [{"turnId": "turn", "item": item}], "nextCursor": None}})
     history = History(pages, "current")
     rows = await history.page()
     assert rows[0]["text"] == "Что сделать?\n• Проверить\n• Исправить\n\nКак назвать проект?"
@@ -101,7 +125,7 @@ async def test_full_reload_recovers_exhausted_ids_and_keeps_pagination_and_live_
         }
     )
     history = History(pages, "current")
-    history.ids = {"left": 100, "right": 101}
+    history.ids = {("turn", "left"): 100, ("turn", "right"): 101}
     history.low, history.high = 100, 101
     history.initialized = True
     history.cursors = {100: "obsolete"}
@@ -114,7 +138,7 @@ async def test_full_reload_recovers_exhausted_ids_and_keeps_pagination_and_live_
     assert await history.page(limit=2) == rows
     older = await history.page(rows[0]["id"], 2)
     assert older[0]["id"] < rows[0]["id"]
-    assert history.live_id("next") > rows[-1]["id"]
+    assert history.live_id("next", "turn") > rows[-1]["id"]
     assert "left" in history.recorded
     assert 100 not in history.cursors
 
@@ -133,8 +157,8 @@ async def test_full_reload_recovers_reordered_live_anchors():
         }
     )
     history = History(pages, "current")
-    history.live_id("right")
-    history.live_id("left")
+    history.live_id("right", "turn")
+    history.live_id("left", "turn")
     rows = await history.page()
     assert [r["text"] for r in rows] == ["left", "missing", "right"]
     assert [r["id"] for r in rows] == sorted({r["id"] for r in rows})
@@ -159,7 +183,12 @@ async def test_reload_after_older_order_error_discards_anchors_outside_latest_pa
     )
     history = History(pages, "current")
     # В свежей странице всё упорядочено, но старые live-якоря расходятся с журналом.
-    history.ids = {"old-left": 200, "old-right": 100, "latest-left": 300, "latest-right": 400}
+    history.ids = {
+        ("turn", "old-left"): 200,
+        ("turn", "old-right"): 100,
+        ("turn", "latest-left"): 300,
+        ("turn", "latest-right"): 400,
+    }
     history.low, history.high = 100, 400
     history.initialized = True
     latest = await history.page(limit=2)

@@ -24,6 +24,63 @@ def registration(server):
     )
 
 
+async def test_relay_older_history_with_reused_ids_preserves_every_message(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.items_error = "thread/items/list is not supported yet"
+    fake.turn_pages = {}
+    for cursor, turn, following in [(None, "new", "older"), ("older", "old", None)]:
+        fake.turn_pages[cursor] = {
+            "data": [
+                {
+                    "id": turn,
+                    "status": "completed",
+                    "items": [
+                        entry("item-1", "userMessage", f"Задача {turn}")["item"],
+                        entry("item-2", text=f"Ответ {turn}")["item"],
+                    ],
+                }
+            ],
+            "nextCursor": following,
+        }
+    mobile, sockets = [], []
+    registered = None
+
+    async def relay_handler(ws):
+        await ws.recv()
+        await ws.send(json.dumps({"v": 1, "type": "challenge", "nonce": "nonce", "ts": 123}))
+        auth = json.loads(await ws.recv())
+        assert auth["sign"] == sign(registered.secret, "nonce", 123, registered.key_id)
+        await ws.send(json.dumps({"v": 1, "type": "ready", "agent": registered.agent, "user": "user"}))
+        sockets.append(ws)
+        async for raw in ws:
+            mobile.append(json.loads(raw))
+
+    async with fake.running() as endpoint, serve(relay_handler, "127.0.0.1", 0) as server:
+        registered = registration(f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/agent")
+        registry = Registry(tmp_path / "registry.json")
+        registry.put(tmp_path, registered)
+        b = Bridge(tmp_path, registry, "current", endpoint)
+        try:
+            await b.start()
+            await until(lambda: bool(sockets))
+            await sockets[0].send(json.dumps({"v": 1, "type": "subscribe", "limit": 2}))
+            await until(lambda: any(f["type"] == "history.done" for f in mobile))
+            newest = [f for f in mobile if f["type"] == "message"]
+            assert [r["text"] for r in newest] == ["Задача new", "Ответ new"]
+            mobile.clear()
+            await sockets[0].send(
+                json.dumps({"v": 1, "type": "history", "before": newest[0]["id"], "limit": 2})
+            )
+            await until(lambda: any(f["type"] == "history.done" for f in mobile))
+            older = [f for f in mobile if f["type"] == "message"]
+            assert [r["text"] for r in older] == ["Задача old", "Ответ old"]
+            assert max(r["id"] for r in older) < min(r["id"] for r in newest)
+            assert not any(f["type"] == "error" for f in mobile)
+            assert not any(c["method"] in {"thread/start", "turn/start", "turn/steer"} for c in fake.calls)
+        finally:
+            await b.close()
+
+
 async def test_relay_hmac_thread_history_run_and_live_answer(tmp_path):
     fake = FakeApp(tmp_path)
     mobile = []
