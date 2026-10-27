@@ -105,6 +105,8 @@ async def test_live_reused_item_id_updates_only_its_turn_and_matches_history(tmp
             )
         sent = [frame for frame in b.relay.sent if frame["type"] in {"delta", "message"}]
         assert sent[0]["id"] == sent[1]["id"] < sent[2]["id"] == sent[3]["id"]
+        assert sent[0]["message_id"] == sent[1]["message_id"]
+        assert sent[2]["message_id"] == sent[3]["message_id"] != sent[0]["message_id"]
 
         async def items(thread, cursor, limit):
             return {
@@ -117,6 +119,7 @@ async def test_live_reused_item_id_updates_only_its_turn_and_matches_history(tmp
 
         b.app.items = items
         rows = await b.history.page()
+        assert [r["message_id"] for r in rows] == [sent[0]["message_id"], sent[2]["message_id"]]
         assert [(row["id"], row["text"]) for row in rows] == [
             (sent[1]["id"], "Старый ответ"),
             (sent[3]["id"], "Новый ответ"),

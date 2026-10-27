@@ -75,6 +75,12 @@ async def test_relay_older_history_with_reused_ids_preserves_every_message(tmp_p
             older = [f for f in mobile if f["type"] == "message"]
             assert [r["text"] for r in older] == ["Задача old", "Ответ old"]
             assert max(r["id"] for r in older) < min(r["id"] for r in newest)
+            identities = {r["text"]: r["message_id"] for r in older + newest}
+            assert len(set(identities.values())) == 4
+            mobile.clear()
+            await sockets[0].send(json.dumps({"v": 1, "type": "subscribe", "limit": 50}))
+            await until(lambda: any(f["type"] == "history.done" for f in mobile))
+            assert {r["text"]: r["message_id"] for r in mobile if r["type"] == "message"} == identities
             assert not any(f["type"] == "error" for f in mobile)
             assert not any(c["method"] in {"thread/start", "turn/start", "turn/steer"} for c in fake.calls)
         finally:

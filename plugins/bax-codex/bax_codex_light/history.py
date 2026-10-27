@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from typing import Any
 
@@ -18,6 +20,14 @@ def submission_key(item: dict) -> str:
 def message_key(turn_id: str, item_id: str) -> tuple[str, str]:
     """Идентичность внутри точного разговора, общая для истории и live-событий."""
     return turn_id, item_id
+
+
+def message_id(thread_id: str, turn_id: str, item_id: str) -> str:
+    """Wire ID: SHA-256 канонического ключа, без текста, даты и номера в ленте."""
+    source = json.dumps(
+        ["bax-message-v1", "codex", thread_id, turn_id, item_id], ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
 def stopped_entry(turn: dict) -> dict | None:
@@ -161,6 +171,7 @@ class History:
                 continue
             row = {
                 "id": self.ids[message_key(entry["turnId"], item["id"])],
+                "message_id": message_id(self.thread_id, entry["turnId"], item["id"]),
                 "kind": view[0],
                 "text": view[1],
                 "turn_id": entry.get("turnId", ""),
@@ -182,7 +193,12 @@ class History:
                     row["created_at"] = entry["created_at"]
             if row["kind"] in {"tool", "thinking"}:
                 if rows and rows[-1]["kind"] == "steps":
-                    rows[-1].update(id=row["id"], text=row["text"], count=rows[-1]["count"] + 1)
+                    rows[-1].update(
+                        id=row["id"],
+                        message_id=row["message_id"],
+                        text=row["text"],
+                        count=rows[-1]["count"] + 1,
+                    )
                 else:
                     rows.append({**row, "kind": "steps", "count": 1})
             else:

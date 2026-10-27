@@ -19,7 +19,7 @@ from .approvals import permission_details, permission_profile, remember_approval
 from .appserver import AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .errors import failure_fields, safe_message
-from .history import History, message_key, render, stopped_entry, submission_key
+from .history import History, message_id, message_key, render, stopped_entry, submission_key
 from .preferences import Preferences
 from .registry import Registration, Registry
 from .tracing import command_context, valid_parent
@@ -801,7 +801,12 @@ class Bridge:
                     detail = values.get((turn, item["id"]), {})
                     if detail and any(previous.get(field) != value for field, value in detail.items()):
                         sent = await self.send(
-                            "message", id=entry_id, kind="assistant", text=text, **{**detail, "turn_id": turn}
+                            "message",
+                            id=entry_id,
+                            message_id=message_id(thread, turn, item["id"]),
+                            kind="assistant",
+                            text=text,
+                            **{**detail, "turn_id": turn},
                         )
                         if sent:
                             previous.update(detail)
@@ -866,6 +871,7 @@ class Bridge:
                 await self.send(
                     "message",
                     id=self.history.live_id(marker["item"]["id"], turn["id"]),
+                    message_id=message_id(self.thread_id, turn["id"], marker["item"]["id"]),
                     kind="event",
                     event="stopped",
                     text="Работа остановлена",
@@ -926,7 +932,14 @@ class Bridge:
                     elif "created_at" in detail:
                         metadata["created_at"] = detail["created_at"]
                 metadata.setdefault("turn_id", params.get("turnId", ""))
-                await self.send("message", id=entry_id, kind=view[0], text=view[1], **metadata)
+                await self.send(
+                    "message",
+                    id=entry_id,
+                    message_id=message_id(self.thread_id, params["turnId"], item["id"]),
+                    kind=view[0],
+                    text=view[1],
+                    **metadata,
+                )
                 self.streamed.add(message_key(params["turnId"], item["id"]))
                 if method == "item/completed" and view[0] == "assistant" and params.get("turnId"):
                     self.refresh_reply_metadata(item, params["turnId"], entry_id, view[1], metadata)
@@ -934,7 +947,13 @@ class Bridge:
             item_id = params["itemId"]
             entry_id = self.history.live_id(item_id, params["turnId"])
             self.streamed.add(message_key(params["turnId"], item_id))
-            await self.send("delta", id=entry_id, chunk=params["delta"], turn_id=params.get("turnId", ""))
+            await self.send(
+                "delta",
+                id=entry_id,
+                message_id=message_id(self.thread_id, params["turnId"], item_id),
+                chunk=params["delta"],
+                turn_id=params["turnId"],
+            )
         elif method == "serverRequest/resolved":
             request_id = params.get("requestId")
             resolved = [qid for qid, value in self.questions.items() if value["request_id"] == request_id]

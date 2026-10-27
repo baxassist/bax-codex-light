@@ -1,7 +1,7 @@
 import pytest
 from conftest import entry
 
-from bax_codex_light.history import History
+from bax_codex_light.history import History, message_id
 
 
 class Pages:
@@ -251,3 +251,27 @@ async def test_user_date_is_forwarded_without_assistant_parameters():
     rows = await History(pages, "current").page()
     assert rows[0]["created_at"] == 1791115200
     assert "model" not in rows[0]
+
+
+def test_message_id_uses_unambiguous_source_key_only():
+    assert message_id("t", "u", "i") == "4a2edaab6f793952a2697758eaa0dc5909d30d4bd2b86190d847f0a1e1d1a83e"
+    assert message_id("a:b", "c", "d") != message_id("a", "b:c", "d")
+    assert message_id("t", "u", "i") != message_id("other", "u", "i")
+    assert message_id("t", "u", "i") != message_id("t", "other", "i")
+
+
+async def test_message_id_survives_rebase_fresh_history_and_content_change():
+    pages = Pages({None: {"data": [entry("right"), entry("left")], "nextCursor": None}})
+    history = History(pages, "current")
+    original = await history.page()
+    history.ids = {("turn", "right"): 1, ("turn", "left"): 2}
+    pages.pages[None]["data"][0]["item"]["text"] = "Исправленный текст"
+    changed = await history.page()
+    fresh = await History(pages, "current").page()
+    assert (
+        [r["message_id"] for r in original]
+        == [r["message_id"] for r in changed]
+        == [r["message_id"] for r in fresh]
+    )
+    assert [r["id"] for r in original] != [r["id"] for r in changed]
+    assert changed[-1]["text"] == "Исправленный текст"
