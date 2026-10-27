@@ -141,6 +141,42 @@ async def test_full_reload_recovers_reordered_live_anchors():
     assert await history.page() == rows
 
 
+async def test_reload_after_older_order_error_discards_anchors_outside_latest_page():
+    pages = Pages(
+        {
+            None: {
+                "data": [
+                    entry("latest-right", text="latest-right"),
+                    entry("latest-left", text="latest-left"),
+                ],
+                "nextCursor": "older",
+            },
+            "older": {
+                "data": [entry("old-right", text="old-right"), entry("old-left", text="old-left")],
+                "nextCursor": None,
+            },
+        }
+    )
+    history = History(pages, "current")
+    # В свежей странице всё упорядочено, но старые live-якоря расходятся с журналом.
+    history.ids = {"old-left": 200, "old-right": 100, "latest-left": 300, "latest-right": 400}
+    history.low, history.high = 100, 400
+    history.initialized = True
+    latest = await history.page(limit=2)
+    stale_cursor = latest[0]["id"]
+    with pytest.raises(ValueError, match="История обновилась"):
+        await history.page(stale_cursor, 2)
+
+    # Повторное открытие должно восстанавливать и якоря за пределами свежей пачки.
+    refreshed = await history.page(limit=2)
+    older = await history.page(refreshed[0]["id"], 2)
+    assert [row["text"] for row in older] == ["old-left", "old-right"]
+    assert [row["id"] for row in older + refreshed] == sorted({row["id"] for row in older + refreshed})
+    with pytest.raises(ValueError, match="Неизвестный курсор"):
+        await history.page(stale_cursor, 2)
+    assert await history.page(limit=2) == refreshed
+
+
 async def test_many_late_insertions_do_not_exhaust_the_bridge():
     pages = Pages(
         {None: {"data": [entry("right", text="right"), entry("left", text="left")], "nextCursor": None}}

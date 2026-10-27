@@ -617,6 +617,42 @@ async def test_subscribe_recovers_dense_history_without_changing_thread_or_permi
         assert not any(c["method"] in {"thread/start", "turn/start", "turn/steer"} for c in fake.calls)
 
 
+async def test_reopen_recovers_older_page_conflict_without_starting_a_turn(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        bridge = owner.sessions["a"]
+
+        async def items(thread_id, cursor, limit):
+            assert thread_id == "a"
+            names = ["latest-right", "latest-left"] if cursor is None else ["old-right", "old-left"]
+            return {
+                "data": [entry(name, text=name) for name in names],
+                "nextCursor": "older" if cursor is None else None,
+            }
+
+        bridge.app.items = items
+        bridge.history.ids = {"old-left": 200, "old-right": 100, "latest-left": 300, "latest-right": 400}
+        bridge.history.low, bridge.history.high = 100, 400
+        bridge.history.initialized = True
+        fake.calls.clear()
+        await owner.on_frame({"type": "subscribe", "limit": 2})
+        owner.relay.frames.clear()
+        await owner.on_frame({"type": "history", "session": "a", "before": 300, "limit": 2})
+        assert any(f["type"] == "error" and f["operation"] == "history" for f in owner.relay.frames)
+
+        owner.relay.frames.clear()
+        await owner.on_frame({"type": "subscribe", "limit": 2})
+        newest = [f for f in owner.relay.frames if f["type"] == "message"]
+        owner.relay.frames.clear()
+        await owner.on_frame({"type": "history", "session": "a", "before": newest[0]["id"], "limit": 2})
+        older = [f for f in owner.relay.frames if f["type"] == "message"]
+        assert [f["text"] for f in older] == ["old-left", "old-right"]
+        assert any(f["type"] == "history.done" for f in owner.relay.frames)
+        assert not any(f["type"] == "error" for f in owner.relay.frames)
+        assert owner.selected == "a"
+        assert not any(c["method"] in {"thread/start", "turn/start", "turn/steer"} for c in fake.calls)
+
+
 async def test_server_voice_job_runs_in_original_background_session_without_selection(tmp_path):
     from uuid import uuid4
 

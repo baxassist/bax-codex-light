@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .images import from_item, preview
+
+log = logging.getLogger(__name__)
 
 
 def identity(item: dict) -> str:
@@ -67,6 +70,7 @@ class History:
         self.low = self.high = 1 << 40
         self.initialized = False
         self.cursors: dict[int, str | None] = {}
+        self.rebase_on_reload = False
 
     def live_id(self, item_id: str) -> int:
         if item_id not in self.ids:
@@ -118,17 +122,20 @@ class History:
         for item_id in chronological:
             if item_id in self.previews:
                 self.live_id(item_id)
+        if before is None and self.rebase_on_reload:
+            self._rebase()
         try:
             self._assign(chronological, newest=before is None and self.initialized)
         except HistoryOrderError:
             if before is not None:
+                # Перезаход перечитывает только свежую пачку: испорченные старые
+                # якоря могут туда не попасть и иначе сохранятся до перезапуска контроллера.
+                self.rebase_on_reload = True
+                log.warning("Изменился порядок старой страницы; следующая загрузка сбросит её шкалу")
                 raise ValueError("История обновилась; заново откройте переписку") from None
             # Полная загрузка заменяет ленту на телефоне (history.done). Новая шкала
             # номеров восстанавливает порядок без изменения истории/разговора Codex.
-            self.low = self.high = max(self.high, max(self.previews.values(), default=0)) + (1 << 20)
-            self.ids = {}
-            self.previews = {}
-            self.cursors = {}
+            self._rebase()
             self._assign(chronological, newest=True)
         self.initialized = True
         rows: list[dict] = []
@@ -174,6 +181,13 @@ class History:
         if rows:
             self.cursors[rows[0]["id"]] = next_cursor
         return rows
+
+    def _rebase(self) -> None:
+        self.low = self.high = max(self.high, max(self.previews.values(), default=0)) + (1 << 20)
+        self.ids = {}
+        self.previews = {}
+        self.cursors = {}
+        self.rebase_on_reload = False
 
     def _assign(self, chronological: list[str], *, newest: bool) -> None:
         """Вставка пропущенных элементов между известными, без изменения старых ID."""
