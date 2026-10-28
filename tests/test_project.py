@@ -48,6 +48,7 @@ class ProjectApp(FakeApp):
         self.permission_configs = {}
         self.requirements = None
         self.mismatch_model = False
+        self.writer_conflicts = set()
         for value in self.threads.values():
             value.update(model="chosen-model", reasoningEffort="high")
         self.models = [
@@ -79,6 +80,21 @@ class ProjectApp(FakeApp):
                     continue
                 method, params = message["method"], message.get("params", {})
                 tid = params.get("threadId")
+                if method == "thread/resume" and tid in self.writer_conflicts:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": message["id"],
+                                "error": {
+                                    "code": -32600,
+                                    "message": (
+                                        f"thread-store conflict: thread {tid} already has an active writer"
+                                    ),
+                                },
+                            }
+                        )
+                    )
+                    continue
                 if (
                     method in {"thread/resume", "thread/items/list", "thread/turns/list"}
                     and tid in self.unmaterialized
@@ -268,6 +284,33 @@ async def test_switch_keeps_active_thread_queue_and_questions(tmp_path):
         assert a.state == "busy" and list(a.queue) == [("pending", "Сообщение для a")]
         assert "qa" in a.questions and not owner.sessions["b"].questions
         assert not any(c["method"] in {"thread/archive", "turn/interrupt"} for c in fake.calls)
+
+
+async def test_fork_owned_by_another_process_preserves_selection_and_reports_conflict(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        fake.threads["b"]["status"] = {"type": "notLoaded"}
+        fake.writer_conflicts.add("b")
+        owner.relay.frames.clear()
+        start = len(fake.calls)
+        await owner.on_frame(
+            {"type": "session.select", "session": "b", "expected_session": "a", "rid": "fork-select"}
+        )
+        failure = next(frame for frame in owner.relay.frames if frame["type"] == "error")
+        assert failure["category"] == "conflict"
+        assert failure["action"] == "open_codex"
+        assert "другом процессе Codex" in failure["message"]
+        assert "active writer" in failure["message"]
+        assert failure["rid"] == "fork-select" and failure["session"] == "b"
+        assert owner.selected == "a" and "b" not in owner.sessions
+        assert not any(frame["type"] == "session.changed" for frame in owner.relay.frames)
+        calls = fake.calls[start:]
+        assert sum(call["method"] == "thread/resume" for call in calls) == 1
+        assert not any(
+            call["method"]
+            in {"thread/start", "thread/fork", "thread/archive", "turn/start", "turn/interrupt"}
+            for call in calls
+        )
 
 
 async def test_system_error_session_opens_with_history_and_failure_reason(tmp_path):

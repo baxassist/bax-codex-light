@@ -11,7 +11,9 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
+from .appserver import RPCError
 from .bridge import Bridge
+from .errors import safe_message
 
 
 def create_server(bridge: Bridge) -> MCPServer:
@@ -52,8 +54,11 @@ def create_server(bridge: Bridge) -> MCPServer:
     @server.tool(annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     async def bax_status(thread_id: str = "") -> dict[str, Any]:
         """Состояние связи, каталог и точный ID разговора, без секретов регистрации."""
-        result = bridge.status(thread_id) if thread_id else bridge.status()
-        return await result if isawaitable(result) else result
+        try:
+            result = bridge.status(thread_id) if thread_id else bridge.status()
+            return await result if isawaitable(result) else result
+        except (ValueError, RPCError) as error:
+            raise ToolError(safe_message(error)) from None
 
     @server.tool(annotations=types.ToolAnnotations(destructiveHint=False, openWorldHint=False))
     async def bax_resolve_question(question_id: str, thread_id: str = "") -> dict[str, Any]:
@@ -63,7 +68,10 @@ def create_server(bridge: Bridge) -> MCPServer:
     @server.tool(annotations=types.ToolAnnotations(destructiveHint=False, openWorldHint=False))
     async def bax_attach(thread_id: str) -> dict[str, Any]:
         """По просьбе человека явно выбрать открытый разговор по его точному CODEX_THREAD_ID."""
-        return await bridge.bind(thread_id)
+        try:
+            return await bridge.bind(thread_id)
+        except (ValueError, RPCError) as error:
+            raise ToolError(safe_message(error)) from None
 
     @server.tool(annotations=types.ToolAnnotations(destructiveHint=False, openWorldHint=True))
     async def bax_publish(text: str, publication_key: str, thread_id: str = "") -> dict[str, Any]:

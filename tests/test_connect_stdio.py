@@ -102,6 +102,13 @@ async def test_connect_stdio_to_relay_to_exact_codex_thread(tmp_path, packaged, 
             # Отказ не закрывает канал и не мешает следующей задаче.
             still_connected = await session.call_tool("bax_status", {"thread_id": "current"})
             assert not still_connected.is_error and still_connected.structured_content["connected"]
+            # MCP исходного чата после fork не должен молча подтверждать связь нового.
+            for tool in ("bax_status", "bax_attach"):
+                mismatch = await session.call_tool(tool, {"thread_id": "fork"})
+                assert mismatch.is_error
+                assert "Этот MCP принадлежит другому разговору" in mismatch.model_dump_json()
+            unchanged = await session.call_tool("bax_status", {"thread_id": "current"})
+            assert unchanged.structured_content["thread_id"] == "current"
             stored = Registry(tmp_path / "registry.json").get(project)
             assert stored.agent == agent
             assert stored.secret == secret

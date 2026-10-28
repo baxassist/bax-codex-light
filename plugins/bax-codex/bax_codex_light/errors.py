@@ -68,7 +68,13 @@ def failure_fields(
         category, action = "request", "edit_request"
     if category == "unknown":
         low = reason.lower()
-        if "model is at capacity" in low or http_status == 503:
+        if re.fullmatch(r"(?:thread-store conflict: )?thread \S+ already has an active writer", low):
+            category, explanation, action = (
+                "conflict",
+                "Разговор уже открыт в другом процессе Codex. Бакс не смог подключиться к его исполнителю.",
+                "open_codex",
+            )
+        elif "model is at capacity" in low or http_status == 503:
             category, explanation, action = REASONS["serverOverloaded"]
         elif http_status == 401:
             category, explanation, action = REASONS["unauthorized"]
