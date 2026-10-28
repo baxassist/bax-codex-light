@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 
 from . import __version__, attachments, files, images, output_images
 from .approvals import permission_details, permission_profile, remember_approval
-from .appserver import AppServer, RPCError, RPCRejected
+from .appserver import AccountUnavailable, AppServer, RPCError, RPCRejected
 from .connection import Relay, network_error
 from .errors import failure_fields, safe_message
 from .history import History, message_id, message_key, render, stopped_entry, submission_key
@@ -44,6 +44,7 @@ class Submission:
     traceparent: str | None = None
     answer_question_ids: list[str] = field(default_factory=list)
     created_at: float | None = field(default_factory=time.time)
+    account_scope: str | None = None
 
     @property
     def preview(self) -> str:
@@ -184,6 +185,8 @@ class Bridge:
             try:
                 self.app = AppServer(self.endpoint)
                 await self.app.open(self.on_event)
+                with contextlib.suppress(AccountUnavailable):
+                    await self.app.account_scope()
                 thread = await self.app.inspect(self.thread_id, self.project)
                 self.project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
                 registration = self.registry.get(self.project)
@@ -372,10 +375,14 @@ class Bridge:
                             "kind": "error",
                             "text": safe_message(submission.error),
                             **failure_fields(
-                                "delivery_rejected"
+                                "account_unavailable"
+                                if submission.delivery == "queued"
+                                else "delivery_rejected"
                                 if submission.delivery == "rejected"
                                 else "delivery_uncertain",
-                                submission.error,
+                                AccountUnavailable(submission.error)
+                                if submission.delivery == "queued"
+                                else submission.error,
                                 operation="run",
                                 rid=submission.request_id or client_id,
                                 delivery=submission.delivery,
@@ -519,7 +526,17 @@ class Bridge:
             await self.send("error.resolved", rid=frame.get("rid"), delivery="accepted")
         elif state == "queued":
             # Очередь уже сохранена; on_frame вызовет _drain без второго элемента.
-            await self.send("run.received", rid=frame.get("rid"), delivery="queued")
+            pending = self.outbox.get(client_id)
+            if pending and pending.error:
+                await self.send_failure(
+                    "account_unavailable",
+                    AccountUnavailable(pending.error),
+                    operation="run",
+                    rid=frame.get("rid"),
+                    delivery="queued",
+                )
+            else:
+                await self.send("run.received", rid=frame.get("rid"), delivery="queued")
         elif state == "rejected":
             self.delivery_receipts.pop(client_id)
             self.outbox.pop(client_id, None)
@@ -569,6 +586,7 @@ class Bridge:
             voice_job_id = str(UUID(frame["voice_job_id"])) if frame.get("voice_job_id") else None
             if voice_job_id and client_id in self.outbox:
                 return
+            account_scope, _ = await self.app.account_scope()
             self.queue.append((client_id, text))
             submission = Submission(
                 text,
@@ -579,6 +597,7 @@ class Bridge:
                 voice_job_id=voice_job_id,
                 traceparent=frame.get("traceparent") if valid_parent(frame.get("traceparent")) else None,
                 steer_allowed=not bool(voice_job_id),
+                account_scope=account_scope,
             )
             self.outbox[client_id] = submission
             self.delivery_receipts[client_id] = {"fingerprint": fingerprint, "state": "queued"}
@@ -605,6 +624,21 @@ class Bridge:
     async def model_started(self) -> None:
         pass
 
+    async def block_account(self, client_id: str, message: str) -> None:
+        submission = self.outbox[client_id]
+        changed = submission.error != message
+        submission.error = message
+        submission.delivery = "queued"
+        self.persist_delivery()
+        if changed:
+            await self.send_failure(
+                "account_unavailable",
+                AccountUnavailable(message),
+                operation="run",
+                rid=submission.request_id or client_id,
+                delivery="queued",
+            )
+
     async def _drain(self) -> None:
         # Очередь может содержать другую команду, принятую до текущего callback.
         # Привязка её исполнения требует сохранённого контекста самой Submission.
@@ -614,36 +648,55 @@ class Bridge:
     async def _drain_queue(self) -> None:
         async with self.lock:
             rejected_steers = set()
+            deferred = set()
             while self.queue and self.app:
-                thread = await self.app.inspect(self.thread_id, self.project)
-                self._set_state(thread["status"])
-                index = 0
-                target_turn = ""
-                if self.state in {"busy", "waiting"}:
-                    index = next(
-                        (i for i, (cid, _) in enumerate(self.queue) if self.outbox[cid].steer_allowed), None
-                    )
-                    if index is not None:
-                        target_turn = self.turn_id or await self.app.active_turn(self.thread_id)
-                    if index is None or not target_turn:
-                        await self.send("status", state=self.state)
-                        return
-                elif self.state != "ready":
-                    await self.send("status", state=self.state)
+                index = next((i for i, (cid, _) in enumerate(self.queue) if cid not in deferred), None)
+                if index is None:
                     return
-                # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
                 client_id, text = self.queue[index]
                 with command_context({"traceparent": self.outbox[client_id].traceparent}):
+                    thread = await self.app.inspect(self.thread_id, self.project)
+                    self._set_state(thread["status"])
+                    try:
+                        scope, revision = await self.app.account_scope()
+                        if self.outbox[client_id].account_scope != scope:
+                            raise AccountUnavailable(
+                                "Задача сохранена, но не отправлена: аккаунт Codex изменился "
+                                "или прежняя привязка неизвестна. Вернитесь в прежний аккаунт "
+                                "либо отправьте новую задачу."
+                            )
+                    except AccountUnavailable as error:
+                        await self.block_account(client_id, str(error))
+                        await self.send("status", state=self.state, authentication=self.app.account_state)
+                        deferred.add(client_id)
+                        continue
+                    target_turn = ""
+                    if self.state in {"busy", "waiting"}:
+                        if self.outbox[client_id].steer_allowed:
+                            target_turn = self.turn_id or await self.app.active_turn(self.thread_id)
+                        if not target_turn:
+                            deferred.add(client_id)
+                            await self.send("status", state=self.state)
+                            continue
+                    elif self.state != "ready":
+                        await self.send("status", state=self.state)
+                        return
+                    await self.send("status", state="busy" if not target_turn else self.state)
+                    # Между проверкой входа и отправкой статус/ошибки могли ждать сеть.
+                    if revision != self.app.account_revision:
+                        await self.send("status", state=self.state, authentication=self.app.account_state)
+                        continue
                     receipt = self.delivery_receipts.get(client_id)
+                    # Убираем до отправки: при обрыве повторять уже доставленную задачу нельзя.
                     if receipt is not None:
                         receipt["state"] = "inflight"
                         self.persist_delivery()
                     del self.queue[index]
                     if not target_turn:
                         self.state = "busy"
-                    await self.send("status", state=self.state)
                     try:
                         submission = self.outbox[client_id]
+                        submission.error = ""
                         extra = {"images": submission.images} if submission.images else {}
                         if target_turn:
                             await self.app.steer_turn(self.thread_id, target_turn, text, client_id, **extra)
@@ -829,6 +882,13 @@ class Bridge:
             await self._on_event(event)
 
     async def _on_event(self, event: dict) -> None:
+        if event["method"] == "account/updated":
+            if self.queue:
+                await self._drain()
+            else:
+                with contextlib.suppress(AccountUnavailable):
+                    await self.app.account_scope()
+            return
         params = event.get("params", {})
         if params.get("threadId") != self.thread_id:
             return
@@ -1185,6 +1245,11 @@ class Bridge:
                 raise ValueError("Очередь заполнена; дождитесь выполнения задач")
             if not self.app or self.app.closed.is_set():
                 raise RPCError("Сессия Codex недоступна; вопрос сохранён для повторной подписки")
+            scope, _ = await self.app.account_scope()
+            if request.setdefault("answer_account_scope", scope) != scope:
+                raise AccountUnavailable(
+                    "Аккаунт Codex изменился во время ответа на вопрос. Вернитесь в него."
+                )
         if request["method"] in {"item/tool/requestUserInput", "agentMessage/asyncQuestion"}:
             option = frame.get("option")
             if frame.get("verdict") != "choice" or not isinstance(option, str) or not option.strip():
@@ -1232,8 +1297,18 @@ class Bridge:
         if len(self.queue) == self.queue.maxlen:
             raise ValueError("Очередь заполнена; дождитесь выполнения задач")
         client_id = str(uuid4())
-        submission = Submission(text, steer_allowed=False, answer_question_ids=list(request["question_ids"]))
+        scope = request.get("answer_account_scope") or (await self.app.account_scope())[0]
+        submission = Submission(
+            text,
+            steer_allowed=False,
+            answer_question_ids=list(request["question_ids"]),
+            account_scope=scope,
+        )
         self.outbox[client_id] = submission
+        receipt = self.delivery_receipts[client_id] = {
+            "fingerprint": hashlib.sha256(text.encode()).hexdigest(),
+            "state": "queued",
+        }
         self.persist_delivery()
         await self.send(
             "message",
@@ -1244,15 +1319,30 @@ class Bridge:
         )
         if self.state in {"busy", "waiting"}:
             try:
+                current, _ = await self.app.account_scope()
+                if scope != current:
+                    raise AccountUnavailable(
+                        "Аккаунт Codex изменился. Ответ сохранён и ожидает прежнего входа."
+                    )
+                receipt["state"] = "inflight"
+                self.persist_delivery()
                 # Ответ идёт в тот ход, который задал вопрос. Другой ход не затрагиваем.
                 await self.app.steer_turn(self.thread_id, request["turn_id"], text, client_id)
+                receipt["state"] = "accepted"
                 await self.confirm_answers(submission)
+                self.persist_delivery()
+                return
+            except AccountUnavailable as error:
+                self.queue.append((client_id, text))
+                await self.block_account(client_id, str(error))
                 return
             except RPCRejected:
-                pass  # Ход уже завершился: обычная очередь того же разговора.
+                receipt["state"] = "queued"  # Ход завершился: обычная очередь того же разговора.
             except Exception:
+                receipt["state"] = "unknown"
                 message = "Доставка ответа не подтверждена. Проверьте разговор перед повторной отправкой."
                 self.outbox[client_id].error = message
+                self.persist_delivery()
                 await self.send_failure(
                     "delivery_uncertain",
                     message,
@@ -1262,6 +1352,7 @@ class Bridge:
                 )
                 return
         self.queue.append((client_id, text))
+        self.persist_delivery()
         await self._drain()
 
     async def close(self) -> None:

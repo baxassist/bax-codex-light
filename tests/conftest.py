@@ -54,6 +54,15 @@ class FakeApp:
         self.turn_pages = None
         self.started = asyncio.Event()
         self.approvals_reviewer = "user"
+        self.account = {
+            "account": {"type": "chatgpt", "email": "test@example.invalid", "planType": "pro"},
+            "requiresOpenaiAuth": True,
+            "workspaceRouting": {
+                "chatgptAccountId": "account-a",
+                "backendOrigin": "https://chatgpt.com",
+                "accountRoutingOverride": "NO_CONSTRAINT",
+            },
+        }
 
     async def handle(self, ws):
         self.connections.add(ws)
@@ -69,6 +78,8 @@ class FakeApp:
                     continue
                 if method == "initialize":
                     result = {"userAgent": "fake/0.160.0"}
+                elif method == "account/read":
+                    result = self.account
                 elif method == "thread/read":
                     result = {"thread": thread(self.project, state=self.state)}
                 elif method == "thread/resume":

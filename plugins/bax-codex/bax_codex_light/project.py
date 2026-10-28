@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import __version__, files, session_status
-from .appserver import EMPTY_THREAD_NAME, AppServer, RPCError, RPCRejected
+from .appserver import EMPTY_THREAD_NAME, AccountUnavailable, AppServer, RPCError, RPCRejected
 from .bridge import SUPPORTS, Bridge, Submission
 from .connection import Relay, network_error
 from .errors import failure_fields, safe_message
@@ -182,6 +182,7 @@ class ProjectController:
                         "request_id": item.request_id,
                         "delivery": item.delivery,
                         "answer_question_ids": item.answer_question_ids,
+                        "account_scope": item.account_scope,
                     }
                     for cid, item in bridge.outbox.items()
                 },
@@ -220,6 +221,7 @@ class ProjectController:
             "controller_pid": os.getpid(),
             "state": "busy" if self.selected in self.compacting else selected.state if selected else "ready",
             "connected": bool(relay and relay.connected),
+            "authentication": self.app.account_state if self.app else "unknown",
             "queued": sum(len(s.queue) for s in self.sessions.values()),
             "unconfirmed": sum(len(s.outbox) for s in self.sessions.values())
             + sum(len(s.get("pending", {})) for s in unavailable),
@@ -274,6 +276,8 @@ class ProjectController:
             try:
                 self.app = AppServer(self.endpoint)
                 await self.app.open(self.on_event)
+                with contextlib.suppress(AccountUnavailable):
+                    await self.app.account_scope()
                 # Восстанавливаем только явно выбранные ранее разговоры этого проекта.
                 for thread_id in set(self.saved) | ({self.selected} if self.selected else set()):
                     try:
@@ -372,6 +376,7 @@ class ProjectController:
                     request_id=pending.get("request_id"),
                     delivery=pending.get("delivery", "unknown"),
                     answer_question_ids=pending.get("answer_question_ids", []),
+                    account_scope=pending.get("account_scope"),
                 )
                 if bridge.delivery_receipts.get(cid, {}).get("state") == "queued":
                     bridge.outbox[cid].error = ""
@@ -737,7 +742,14 @@ class ProjectController:
                 client_id = frame.get("client_id")
                 if not turn_id and client_id in bridge.outbox:
                     pending = bridge.outbox[client_id]
-                    status = "failed" if pending.error else "queued"
+                    receipt = bridge.delivery_receipts.get(client_id, {})
+                    status = (
+                        "queued"
+                        if receipt.get("state") == "queued"
+                        else "failed"
+                        if pending.error
+                        else "queued"
+                    )
                 else:
                     if not turn_id:
                         page = await self.app.items(target, None, 100)
@@ -989,6 +1001,15 @@ class ProjectController:
         return result
 
     async def on_event(self, event: dict) -> None:
+        if event["method"] == "account/updated":
+            # Авторизация принадлежит исполнителю, а не выбранному разговору.
+            with contextlib.suppress(AccountUnavailable):
+                await self.app.account_scope()
+            for bridge in list(self.sessions.values()):
+                if bridge.queue:
+                    await bridge._drain()
+                await bridge.send("status", state=bridge.state, authentication=self.app.account_state)
+            return
         params = event.get("params", {})
         thread_id = params.get("threadId")
         bridge = self.sessions.get(thread_id)

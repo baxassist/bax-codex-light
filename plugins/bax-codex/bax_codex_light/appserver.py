@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -35,6 +36,17 @@ class RPCError(RuntimeError):
     pass
 
 
+class AccountUnavailable(RPCError):
+    """Вызов ещё не отправлен: нужно восстановить вход, а не повторять модель."""
+
+    native_info = "unauthorized"
+
+
+class AccountReadResponse(schemas.GetAccountResponse):
+    # Ответ 0.165 дополнен routing; сам тип routing уже есть в закреплённом SDK.
+    workspace_routing: schemas.WorkspaceRouting | None = Field(default=None, alias="workspaceRouting")
+
+
 class RPCRejected(RPCError):
     """Сервер явно отклонил запрос: в отличие от тайм-аута, ответ получен."""
 
@@ -63,6 +75,8 @@ class AppServer:
         self.threads: dict[str, dict] = {}
         self.metadata: dict[str, ResponseMetadata] = {}
         self.metadata_lock = asyncio.Lock()
+        self.account_revision = 0
+        self.account_state = "unknown"
 
     async def open(self, handler: EventHandler | None = None) -> None:
         self.handler = handler
@@ -120,6 +134,11 @@ class AppServer:
                         else:
                             future.set_result(message.get("result", {}))
                 elif "method" in message:
+                    if message["method"] == "account/updated":
+                        # Инвалидация в reader до выдачи следующего RPC-ответа:
+                        # consumer может быть занят обработкой другого события.
+                        self.account_revision += 1
+                        self.account_state = "unknown"
                     self.events.put_nowait(message)
         except (Exception, asyncio.CancelledError):
             pass
@@ -129,6 +148,7 @@ class AppServer:
                     future.set_exception(RPCError("Связь с app-server потеряна"))
             self.pending.clear()
             self.closed.set()
+            self.account_state = "unknown"
             if self.ws is not None:
                 await self.ws.close()
 
@@ -200,6 +220,43 @@ class AppServer:
             raise RPCError("Эта сессия Codex не принимает прямые задачи")
         self.threads[thread_id] = thread
         return thread
+
+    async def account_scope(self) -> tuple[str, int]:
+        """Сверка входа через Codex; в очередь попадает только отпечаток, не PII."""
+        for _ in range(3):
+            revision = self.account_revision
+            try:
+                result = await self.typed(
+                    "account/read", schemas.GetAccountParams, AccountReadResponse, {"refreshToken": False}
+                )
+            except (RPCError, TimeoutError, OSError, ValueError) as error:
+                self.account_state = "unknown"
+                raise AccountUnavailable(
+                    "Не удалось проверить аккаунт Codex. Задача не отправлена."
+                ) from error
+            if revision != self.account_revision:
+                continue
+            account = result.get("account") or {}
+            if not account and result["requiresOpenaiAuth"]:
+                self.account_state = "signed_out"
+                raise AccountUnavailable("Выполните вход в Codex на компьютере. Задача не отправлена.")
+            if account.get("type") == "chatgpt":
+                routing = result.get("workspaceRouting") or {}
+                if not routing.get("chatgptAccountId") or not routing.get("backendOrigin"):
+                    self.account_state = "unknown"
+                    raise AccountUnavailable(
+                        "Codex не передал идентификатор аккаунта. Обновите Codex; задача не отправлена."
+                    )
+                identity = ["chatgpt", routing["backendOrigin"], routing["chatgptAccountId"]]
+            else:
+                # Для локальных/API-key providers нет ChatGPT account ID.
+                # Проверяем доступность; смену API-ключей этот контракт не различает.
+                identity = ["provider", self.endpoint, account.get("type"), result["requiresOpenaiAuth"]]
+            self.account_state = "ready"
+            digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+            return digest, revision
+        self.account_state = "unknown"
+        raise AccountUnavailable("Аккаунт Codex меняется. Дождитесь завершения входа; задача не отправлена.")
 
     async def inspect(self, thread_id: str, project: Path | None = None) -> dict:
         thread = await self.read_thread(thread_id, project)

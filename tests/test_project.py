@@ -110,6 +110,8 @@ class ProjectApp(FakeApp):
                     continue
                 if method == "initialize":
                     result = {"userAgent": "fake/0.160.0"}
+                elif method == "account/read":
+                    result = self.account
                 elif method == "thread/read":
                     result = {"thread": self.threads[tid]}
                 elif method == "skills/list":

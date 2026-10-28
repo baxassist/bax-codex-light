@@ -22,6 +22,11 @@ class FakeApp:
         self.fail = False
         self.history_items = []
         self.approvals = {}
+        self.account_revision = 0
+        self.account_state = "ready"
+
+    async def account_scope(self):
+        return "synthetic-account", self.account_revision
 
     async def inspect(self, thread_id, project):
         return {"status": {"type": self.state, "activeFlags": []}}
