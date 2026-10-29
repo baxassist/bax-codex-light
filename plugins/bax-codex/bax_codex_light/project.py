@@ -301,7 +301,10 @@ class ProjectController:
                 relay_task = asyncio.create_task(self.relay.run(self.on_ready, self.on_frame))
                 attempt = 0
                 await self.app.closed.wait()
-                raise RPCError("Связь с Codex потеряна; контроллер проекта повторит подключение")
+                raise RPCError(
+                    self.app.disconnect_error
+                    or "Связь с Codex потеряна; контроллер проекта повторит подключение"
+                )
             except Exception as error:
                 self.error_code, self.error = network_error(error, "локальному серверу Codex")
                 if isinstance(error, RPCError):

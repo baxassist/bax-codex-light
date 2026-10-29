@@ -16,6 +16,7 @@ from openai_codex.generated import v2_all as schemas
 from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from pydantic import Field
 from websockets.asyncio.client import connect, unix_connect
+from websockets.exceptions import ConnectionClosed
 
 from . import __version__, background
 from .history import stopped_entry
@@ -24,6 +25,9 @@ from .tracing import dependency
 
 EventHandler = Callable[[dict], Awaitable[None]]
 EMPTY_THREAD_NAME = "Новая сессия"
+# Legacy Codex возвращает ход целиком, включая журналы инструментов: один ход
+# реального проекта превысил 16 МиБ. Предел остаётся конечным для обоих транспортов.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 class ThreadStartWithHistoryParams(schemas.ThreadStartParams):
@@ -77,22 +81,24 @@ class AppServer:
         self.metadata_lock = asyncio.Lock()
         self.account_revision = 0
         self.account_state = "unknown"
+        self.disconnect_error = ""
 
     async def open(self, handler: EventHandler | None = None) -> None:
         self.handler = handler
         self.closed.clear()
+        self.disconnect_error = ""
         if "://" in self.endpoint:
             url = urlsplit(self.endpoint)
             if url.scheme != "ws" or url.hostname not in {"localhost", "127.0.0.1", "::1"}:
                 raise ValueError("App-server должен быть локальным: Unix socket или loopback ws://")
             self.ws = await connect(
-                self.endpoint, max_size=16 * 1024 * 1024, open_timeout=self.timeout, close_timeout=2
+                self.endpoint, max_size=MAX_MESSAGE_BYTES, open_timeout=self.timeout, close_timeout=2
             )
         else:
             self.ws = await unix_connect(
                 self.endpoint,
                 uri="ws://localhost/",
-                max_size=16 * 1024 * 1024,
+                max_size=MAX_MESSAGE_BYTES,
                 open_timeout=self.timeout,
                 close_timeout=2,
             )
@@ -116,6 +122,7 @@ class AppServer:
             raise
 
     async def _read(self) -> None:
+        failure = "Связь с app-server потеряна"
         try:
             async for payload in self.ws:
                 message = json.loads(payload)
@@ -140,12 +147,16 @@ class AppServer:
                         self.account_revision += 1
                         self.account_state = "unknown"
                     self.events.put_nowait(message)
+        except ConnectionClosed as error:
+            if error.sent is not None and error.sent.code == 1009:
+                failure = f"Ответ Codex превышает предел чтения ({MAX_MESSAGE_BYTES} байт)"
         except (Exception, asyncio.CancelledError):
             pass
         finally:
+            self.disconnect_error = failure
             for future in self.pending.values():
                 if not future.done():
-                    future.set_exception(RPCError("Связь с app-server потеряна"))
+                    future.set_exception(RPCError(failure))
             self.pending.clear()
             self.closed.set()
             self.account_state = "unknown"
@@ -185,6 +196,13 @@ class AppServer:
                 return await asyncio.wait_for(future, self.timeout)
         finally:
             self.pending.pop(request_id, None)
+            # send и reader могут одновременно обнаружить разрыв; исключение
+            # неожиданного Future не должно теряться после ошибки самого send.
+            if future.done():
+                if not future.cancelled():
+                    future.exception()
+            else:
+                future.cancel()
 
     async def typed(self, method: str, params_type: type, response_type: type, params: dict) -> dict:
         request = params_type.model_validate(params).model_dump(
