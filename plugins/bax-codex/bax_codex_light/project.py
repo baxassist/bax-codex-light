@@ -743,6 +743,13 @@ class ProjectController:
                 turn_id = frame.get("turn_id", "")
                 status = "unknown"
                 client_id = frame.get("client_id")
+                if not turn_id and (not isinstance(client_id, str) or not client_id.strip()):
+                    # An absent identity must never match a history item whose
+                    # clientId is also absent. Old explicit-turn queries remain
+                    # compatible; new unbound jobs carry their stable client_id.
+                    await self.send("voice.status", session=target, rid=frame.get("rid"),
+                                    turn_id="", status="unknown")
+                    return
                 if not turn_id and client_id in bridge.outbox:
                     pending = bridge.outbox[client_id]
                     receipt = bridge.delivery_receipts.get(client_id, {})
