@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from uuid import uuid4
 
 import pytest
 from conftest import FakeApp, entry, thread, until
 from test_integration import registration
 
-from bax_codex_light.appserver import AppServer
+from bax_codex_light import project as project_module
+from bax_codex_light.appserver import AppServer, RPCError
 from bax_codex_light.bridge import Submission
 from bax_codex_light.power import IdleSleepGuard
 from bax_codex_light.project import ProjectController
@@ -270,6 +272,58 @@ async def project_controller(tmp_path):
             yield fake, owner
         finally:
             await app.close()
+
+
+async def test_attach_waits_for_controller_past_old_three_second_limit(tmp_path):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        background = owner.sessions["a"]
+        background.state = "busy"
+        background.queue.append(("pending", "Фоновая задача"))
+        stopped = asyncio.Event()
+
+        async def startup():
+            await asyncio.sleep(3.1)
+            owner.ready.set()
+            await stopped.wait()
+
+        owner.task = asyncio.create_task(startup())
+        try:
+            result = await owner.attach("b")
+            assert result["thread_id"] == "b"
+            assert background.state == "busy"
+            assert list(background.queue) == [("pending", "Фоновая задача")]
+            assert not any(c["method"] in {"thread/archive", "turn/interrupt"} for c in fake.calls)
+        finally:
+            owner.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await owner.task
+
+
+async def test_attach_timeout_is_explained_and_does_not_cancel_startup_or_select(tmp_path, monkeypatch):
+    async with project_controller(tmp_path) as (fake, owner):
+        await owner.select("a")
+        background = owner.sessions["a"]
+        background.state = "busy"
+        background.queue.append(("pending", "Фоновая задача"))
+        monkeypatch.setattr(project_module, "ATTACH_READY_TIMEOUT", 0.02)
+        owner.task = asyncio.create_task(asyncio.Event().wait())
+        previous_calls = len(fake.calls)
+        try:
+            with pytest.raises(RPCError, match="Контроллер Codex ещё не готов"):
+                await owner.attach("b")
+            assert not owner.task.done()
+            assert not owner.ready.is_set()
+            assert owner.selected == "a" and "b" not in owner.sessions
+            assert background.state == "busy"
+            assert list(background.queue) == [("pending", "Фоновая задача")]
+            assert len(fake.calls) == previous_calls
+            owner.ready.set()
+            assert (await owner.attach("b"))["thread_id"] == "b"
+        finally:
+            owner.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await owner.task
 
 
 async def test_switch_keeps_active_thread_queue_and_questions(tmp_path):

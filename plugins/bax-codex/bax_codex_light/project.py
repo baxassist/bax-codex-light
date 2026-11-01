@@ -25,6 +25,7 @@ from .registry import Registration, Registry
 from .tracing import valid_parent
 
 log = logging.getLogger(__name__)
+ATTACH_READY_TIMEOUT = 15
 PROJECT_SUPPORTS = [
     *SUPPORTS,
     "sessions.list",
@@ -398,7 +399,12 @@ class ProjectController:
         async with self.lock:
             if not self.task or self.task.done():
                 await self.start()
-            await asyncio.wait_for(self.ready.wait(), 3)
+            try:
+                await asyncio.wait_for(self.ready.wait(), ATTACH_READY_TIMEOUT)
+            except TimeoutError:
+                raise RPCError(
+                    "Контроллер Codex ещё не готов после 15 секунд ожидания. Проверьте bax_status чуть позже."
+                ) from None
             if not self.app or self.app.closed.is_set():
                 raise RPCError(self.error or "Codex пока недоступен")
             await self.app.inspect(thread_id, self.project)
