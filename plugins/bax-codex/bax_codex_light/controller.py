@@ -140,6 +140,21 @@ class ProjectClient:
         self.task: asyncio.Task | None = None
         self.ready = asyncio.Event()
 
+    @contextlib.asynccontextmanager
+    async def caller(self, thread_id: str):
+        """Контекст конкретного MCP-вызова; fork не меняет клиента родителя."""
+        app = AppServer(self.endpoint)
+        try:
+            await app.open()
+            thread = await app.inspect(thread_id, self.project)
+        finally:
+            await app.close()
+        client = ProjectClient(Path(thread["cwd"]), self.registry, thread_id, self.endpoint)
+        try:
+            yield client
+        finally:
+            await client.close()
+
     async def start(self) -> None:
         # Инициализация MCP не ждёт доступности Codex; required-инструменты готовы сразу.
         if self.thread_id and self.task is None:

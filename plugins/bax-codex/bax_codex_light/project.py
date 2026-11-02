@@ -218,6 +218,7 @@ class ProjectController:
             "mode": "project",
             "project": str(self.project),
             "thread_id": self.selected or None,
+            "selected_error": self.saved.get(self.selected, {}).get("error", "") if not selected else "",
             "controller_id": self.identity,
             "controller_pid": os.getpid(),
             "state": "busy" if self.selected in self.compacting else selected.state if selected else "ready",
@@ -284,8 +285,7 @@ class ProjectController:
                     try:
                         await self.ensure_session(thread_id)
                     except RPCError as error:
-                        if self.selected == thread_id:
-                            self.selected = ""
+                        # Ошибка восстановления не отменяет выбор пользователя.
                         # Недоступная/архивная сессия не отменяет неопределённую доставку.
                         self.saved.setdefault(thread_id, {})["error"] = safe_message(error)
                 registration = self.registry.get(self.project)

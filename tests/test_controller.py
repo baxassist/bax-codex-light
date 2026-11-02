@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from conftest import until
 from test_project import ProjectApp
+from websockets.exceptions import WebSocketException
 
 from bax_codex_light.appserver import RPCError
 from bax_codex_light.controller import ProjectClient, private_directory, request, runtime_path
@@ -85,6 +86,15 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
         await client.bind("a")
         original_request = controller.request
         stopped = asyncio.Event()
+        import_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        original_run = controller.subprocess.run
+
+        def checked_import(*args, **kwargs):
+            loop.call_soon_threadsafe(import_started.set)
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(controller.subprocess, "run", checked_import)
 
         async def older(directory, method, **params):
             result = await original_request(directory, method, **params)
@@ -106,9 +116,12 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
                 # между задачами может быть меньше секунды.
                 await asyncio.sleep(1.1)
                 assert (await original_request(directory, "status"))["controller_pid"] == old_pid
+                assert not import_started.is_set()
                 fake.threads["a"]["status"] = {"type": "idle"}
                 await fake.emit("thread/status/changed", {"threadId": "a", "status": {"type": "idle"}})
-                await asyncio.wait_for(stopped.wait(), 0.8)
+                # Измеряем реакцию на idle, не скорость холодного импорта SDK.
+                await asyncio.wait_for(import_started.wait(), 0.8)
+                await asyncio.wait_for(stopped.wait(), 16)
                 await asyncio.wait_for(client.ready.wait(), 8)
                 current = await original_request(directory, "status")
                 assert current["controller_pid"] != old_pid
@@ -209,14 +222,14 @@ async def test_mcp_recovers_lost_owner_without_manual_status_or_reattach(tmp_pat
                         current = await request(directory, "status")
                         if current["controller_pid"] != old_pid:
                             break
-                    except (OSError, RPCError):
+                    except (OSError, RPCError, WebSocketException):
                         pass
                     await asyncio.sleep(0.02)
             assert current["thread_id"] == "a"
             assert not any(call["method"] == "thread/start" for call in fake.calls)
         finally:
             await client.close()
-            with contextlib.suppress(OSError, RPCError):
+            with contextlib.suppress(OSError, RPCError, WebSocketException):
                 await request(directory, "shutdown")
 
 
@@ -285,3 +298,31 @@ async def test_broken_candidate_cannot_disconnect_previous_owner(tmp_path, monke
         finally:
             await client.close()
             await original(directory, "shutdown")
+
+
+async def test_restore_writer_conflict_keeps_selected_thread_and_pending(tmp_path):
+    import json
+
+    from bax_codex_light.project import ProjectController
+
+    fake = ProjectApp(tmp_path)
+    fake.writer_conflicts.add("a")
+    registry = Registry(tmp_path / "registry.json")
+    state = tmp_path / "state.json"
+    async with fake.running() as endpoint:
+        owner = ProjectController(tmp_path, registry, state, endpoint)
+        owner.selected = "a"
+        owner.saved = {"a": {"pending": {"uncertain": {"text": "Не повторять"}}}, "b": {}}
+        owner.save()
+        await owner.start()
+        try:
+            await asyncio.wait_for(owner.ready.wait(), 5)
+            assert owner.selected == "a"
+            assert "a" not in owner.sessions and "b" in owner.sessions
+            assert "active writer" in owner.saved["a"]["error"]
+            assert "active writer" in owner.status()["selected_error"]
+            assert owner.saved["a"]["pending"]["uncertain"]["text"] == "Не повторять"
+            assert not any(c["method"].startswith("turn/") for c in fake.calls)
+        finally:
+            await owner.close()
+        assert json.loads(state.read_text())["selected"] == "a"
