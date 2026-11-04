@@ -139,6 +139,7 @@ class ProjectClient:
         self.error_code = ""
         self.task: asyncio.Task | None = None
         self.ready = asyncio.Event()
+        self.callers: dict[tuple[Path, str], ProjectClient] = {}
 
     @contextlib.asynccontextmanager
     async def caller(self, thread_id: str):
@@ -149,11 +150,16 @@ class ProjectClient:
             thread = await app.inspect(thread_id, self.project)
         finally:
             await app.close()
-        client = ProjectClient(Path(thread["cwd"]), self.registry, thread_id, self.endpoint)
-        try:
-            yield client
-        finally:
-            await client.close()
+        project = await asyncio.to_thread(Path(thread["cwd"]).resolve)
+        key = (project, thread_id)
+        client = self.callers.get(key)
+        if client is None:
+            client = ProjectClient(project, self.registry, thread_id, self.endpoint)
+            self.callers[key] = client
+        # Наблюдатель принадлежит MCP, а не короткому вызову инструмента.
+        # Он должен увидеть idle после ответа; контексты fork остаются раздельными.
+        await client.start()
+        yield client
 
     async def start(self) -> None:
         # Инициализация MCP не ждёт доступности Codex; required-инструменты готовы сразу.
@@ -423,6 +429,9 @@ class ProjectClient:
 
     async def close(self) -> None:
         # EOF одного окна не останавливает контроллер, фоновые задачи и их вопросы.
+        callers, self.callers = self.callers, {}
+        for client in callers.values():
+            await client.close()
         if self.task:
             self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

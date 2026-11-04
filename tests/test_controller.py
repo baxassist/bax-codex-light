@@ -326,3 +326,50 @@ async def test_restore_writer_conflict_keeps_selected_thread_and_pending(tmp_pat
         finally:
             await owner.close()
         assert json.loads(state.read_text())["selected"] == "a"
+
+
+async def test_shared_caller_updates_after_call_finishes_without_another_tool(tmp_path, monkeypatch):
+    import bax_codex_light.controller as controller
+
+    fake = ProjectApp(tmp_path)
+    registry = Registry(tmp_path / "registry.json")
+    async with fake.running() as endpoint:
+        owner = ProjectClient(tmp_path, registry, "a", endpoint)
+        shared = ProjectClient(None, registry, endpoint=endpoint)
+        directory = await owner.ensure_controller()
+        await owner.bind("a")
+        original_request = controller.request
+        old_pid = (await original_request(directory, "status"))["controller_pid"]
+        fake.threads["a"]["status"] = {"type": "active", "activeFlags": []}
+        await fake.emit("thread/status/changed", {"threadId": "a", "status": fake.threads["a"]["status"]})
+
+        async def older(directory, method, **params):
+            result = await original_request(directory, method, **params)
+            if method == "status" and result["controller_pid"] == old_pid:
+                result["plugin_version"] = "0.4.0"
+            return result
+
+        monkeypatch.setattr(controller, "request", older)
+        try:
+            async with shared.caller("a") as caller:
+                assert (await caller.status())["controller_pid"] == old_pid
+            await asyncio.sleep(0.5)
+            assert (await original_request(directory, "status"))["controller_pid"] == old_pid
+            fake.threads["a"]["status"] = {"type": "idle"}
+            await fake.emit("thread/status/changed", {"threadId": "a", "status": {"type": "idle"}})
+            async with asyncio.timeout(10):
+                while True:
+                    try:
+                        current = await original_request(directory, "status")
+                        if current["controller_pid"] != old_pid:
+                            break
+                    except (OSError, RPCError, WebSocketException):
+                        pass
+                    await asyncio.sleep(0.05)
+            assert current["thread_id"] == "a"
+            assert not any(c["method"] == "thread/start" for c in fake.calls)
+        finally:
+            await shared.close()
+            await owner.close()
+            await original_request(directory, "shutdown")
+            await until(lambda: not fake.connections)
