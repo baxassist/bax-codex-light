@@ -19,6 +19,7 @@ import venv
 from pathlib import Path
 
 MIN_PYTHON = (3, 11)
+RUNTIME_LAYOUT_REVISION = "venv2"
 ROOT = Path(__file__).resolve().parent
 
 
@@ -35,7 +36,11 @@ def ensure_python() -> None:
         if not candidate or not Path(candidate).is_file():
             continue
         probe = subprocess.run(
-            [candidate, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"],
+            [
+                candidate,
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10,
@@ -45,15 +50,33 @@ def ensure_python() -> None:
     raise RuntimeError("Для плагина Бакс нужен установленный Python 3.11 или новее")
 
 
+def runtime_identity(requirements: bytes, cache_tag: str, platform: str) -> dict[str, str]:
+    """Чистая идентичность кеша для bootstrap и предварительной проверки подготовки.
+
+    Разметка v2 использует штатные символьные ссылки POSIX venv. Старые копии и
+    частичные окружения сохраняются: их ключи здесь не принимаются и не удаляются.
+    """
+    digest = hashlib.sha256(requirements).hexdigest()
+    return {
+        "name": f"{cache_tag}-{platform}-{digest[:16]}-{RUNTIME_LAYOUT_REVISION}",
+        "requirements_sha256": digest,
+        "ready": digest[:16] + "\n",
+    }
+
+
 def runtime_python() -> Path:
     started = time.monotonic()
     requirements = ROOT / "requirements.txt"
-    digest = hashlib.sha256(requirements.read_bytes()).hexdigest()[:16]
+    identity = runtime_identity(
+        requirements.read_bytes(),
+        sys.implementation.cache_tag,
+        sysconfig.get_platform(),
+    )
     data = Path(os.environ.get("BAX_CODEX_PLUGIN_DATA", str(Path.home() / ".bax/codex-runtime")))
     data.mkdir(mode=0o700, parents=True, exist_ok=True)
     if data.is_symlink():
         raise RuntimeError("Каталог окружения Бакса не должен быть symlink")
-    name = f"{sys.implementation.cache_tag}-{sysconfig.get_platform()}-{digest}"
+    name = identity["name"]
     runtime = data / name
     python = runtime / "bin/python"
     ready = runtime / ".ready"
@@ -70,14 +93,26 @@ def runtime_python() -> Path:
                 time.sleep(0.1)
         if runtime.is_symlink():
             raise RuntimeError("Окружение Бакса не должно быть symlink")
+        if ready.is_symlink():
+            raise RuntimeError("Маркер окружения Бакса не должен быть symlink")
         if ready.is_file() and python.is_file():
+            if ready.read_text() != identity["ready"]:
+                raise RuntimeError("Маркер окружения Бакса не соответствует зависимостям")
             print(
-                f"Бакс: готовое окружение ({time.monotonic() - started:.2f} с).", file=sys.stderr, flush=True
+                f"Бакс: готовое окружение ({time.monotonic() - started:.2f} с).",
+                file=sys.stderr,
+                flush=True,
             )
             return python
-        print("Бакс: первый запуск, устанавливаю библиотеки плагина…", file=sys.stderr, flush=True)
+        print(
+            "Бакс: первый запуск, устанавливаю библиотеки плагина…",
+            file=sys.stderr,
+            flush=True,
+        )
         runtime.mkdir(mode=0o700, exist_ok=True)
-        venv.EnvBuilder(with_pip=True).create(runtime)
+        # Повторяем python -m venv на POSIX: отдельная копия интерпретатора macOS
+        # может потерять относительный путь libpython при переносе в это окружение.
+        venv.EnvBuilder(with_pip=True, symlinks=os.name != "nt").create(runtime)
         # Закреплены все зависимости и хеши. Пользовательские библиотеки не меняются.
         result = subprocess.run(
             [
@@ -102,9 +137,11 @@ def runtime_python() -> Path:
         )
         if result.returncode:
             raise RuntimeError("Не удалось установить библиотеки. Проверьте интернет и переподключите MCP")
-        ready.write_text(digest + "\n")
+        ready.write_text(identity["ready"])
         print(
-            f"Бакс: библиотеки установлены ({time.monotonic() - started:.2f} с).", file=sys.stderr, flush=True
+            f"Бакс: библиотеки установлены ({time.monotonic() - started:.2f} с).",
+            file=sys.stderr,
+            flush=True,
         )
     return python
 
@@ -119,7 +156,11 @@ def main() -> None:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(ROOT)
         env["PYTHONNOUSERSITE"] = "1"
-        print("Бакс: запускаю MCP; подключение к Codex проверяется в фоне.", file=sys.stderr, flush=True)
+        print(
+            "Бакс: запускаю MCP; подключение к Codex проверяется в фоне.",
+            file=sys.stderr,
+            flush=True,
+        )
         os.execve(str(python), [str(python), "-m", "bax_codex_light", *sys.argv[1:]], env)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"Бакс: {error}", file=sys.stderr)

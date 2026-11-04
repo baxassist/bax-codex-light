@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,7 +12,9 @@ def test_codex_resolves_plugin_paths_and_preserves_user_settings(installed_plugi
     assert (Path(installed_plugin["cwd"]) / "bootstrap.py").is_file()
 
 
-def test_native_first_turn_waits_for_pending_plugin(installed_plugin, tmp_path):
+def test_native_first_turn_waits_for_pending_plugin(installed_plugin, tmp_path, request):
+    from native_catalog_process import run_native_catalog
+
     runtime = os.environ.get("BAX_TEST_PLUGIN_RUNTIME")
     if not runtime:
         pytest.skip("Нужно подготовленное окружение BAX_TEST_PLUGIN_RUNTIME; тест ничего не скачивает")
@@ -57,7 +58,7 @@ def test_native_first_turn_waits_for_pending_plugin(installed_plugin, tmp_path):
         env["CODEX_HOME"] = str(home)
         started = time.monotonic()
         try:
-            result = subprocess.run(
+            result = run_native_catalog(
                 [
                     "codex",
                     "exec",
@@ -70,9 +71,9 @@ def test_native_first_turn_waits_for_pending_plugin(installed_plugin, tmp_path):
                     "Проверка каталога инструментов; никаких действий не выполняй.",
                 ],
                 env=env,
-                capture_output=True,
-                text=True,
                 timeout=30,
+                directory=tmp_path / "owned-native-catalog",
+                request=request,
             )
         finally:
             server.shutdown()

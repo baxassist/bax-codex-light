@@ -1,5 +1,13 @@
 # Bax Codex Lite
 
+Версия 0.5.38: загрузчик создаёт POSIX-окружение Python с символьными ссылками,
+чтобы копия интерпретатора macOS не теряла путь к libpython. Новый ключ `venv2`
+отделяет его от старых полных и частичных окружений; старые каталоги не удаляются.
+Маркер готовности проверяется по хешу зависимостей, symlink-маркер отклоняется.
+Нативные тесты сохраняют квитанции создания/завершения собственных процессов
+и останавливают набор при неизвестном результате cleanup.
+Подробности и границы проверок — [окружение и тесты](docs/runtime-testing.md).
+
 Версия 0.5.37: общий MCP различает родительский разговор и fork по `threadId`
 каждого вызова Codex. `bax_attach()` получает ID автоматически; явный несовпадающий
 ID отклоняется. Статус не меняет выбранную сессию, параллельные вызовы не меняют
@@ -583,9 +591,16 @@ uv sync --locked
 Для проверки упакованного плагина один раз подготовьте **временное** окружение и выполните:
 
 ```bash
-BAX_CODEX_PLUGIN_DATA=/private/tmp/bax-codex-plugin-runtime python3 plugins/bax-codex/bootstrap.py --prepare
-BAX_TEST_PLUGIN_RUNTIME=/private/tmp/bax-codex-plugin-runtime .venv/bin/pytest tests -q
+export PATH="$PWD/.venv/bin:$PATH"  # python3 у MCP и Python тестов должны совпадать
+TEST_ROOT=$(mktemp -d /private/tmp/bax-plugin-check.XXXXXX)
+BAX_CODEX_PLUGIN_DATA="$TEST_ROOT/runtime" .venv/bin/python plugins/bax-codex/bootstrap.py --prepare
+BAX_TEST_PLUGIN_RUNTIME="$TEST_ROOT/runtime" .venv/bin/pytest tests -q --basetemp "$TEST_ROOT/pytest" --junitxml "$TEST_ROOT/results.xml"
 ```
+
+`--prepare` скачивает закреплённые зависимости; используйте новый каталог для каждого независимого прогона.
+Нативные session/schema проверки требуют CLI Codex0.160.0 в PATH: другой CLI даёт
+явный skip, а не подтверждение совместимости. Не заменяйте пользовательский CLI ради тестов.
+Подробности — [runtime-testing.md](docs/runtime-testing.md).
 
 Сами тесты не скачивают зависимости. Они используют временные регистрации и локальные
 имитаторы, проверяют HMAC, задачу в точный разговор, историю, разрешения, изоляцию,
