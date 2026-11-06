@@ -132,3 +132,21 @@ async def test_reopen_restores_subscription_without_selecting_over_other_session
         assert owner.sessions["b"].state != "offline"
         assert sum(c["method"] == "thread/resume" for c in fake.calls) == before + 1
         assert owner.selected == "a"
+
+
+def test_packaged_hooks_have_distinct_user_visible_titles():
+    import json
+    from pathlib import Path
+
+    source = Path(__file__).parents[1] / "plugins/bax-codex/hooks/hooks.json"
+    config = json.loads(source.read_text())
+    assert set(config["hooks"]) == {"SessionStart", "UserPromptSubmit"}
+    handlers = [
+        handler for groups in config["hooks"].values() for group in groups for handler in group["hooks"]
+    ]
+    assert len(handlers) == 2
+    # Codex /hooks renders statusMessage as the title, otherwise "Unnamed hook".
+    titles = [handler.get("statusMessage", "").strip() for handler in handlers]
+    assert all(title.startswith("Бакс: ") for title in titles)
+    assert len(set(titles)) == 2
+    assert all(handler["async"] is True for handler in handlers)

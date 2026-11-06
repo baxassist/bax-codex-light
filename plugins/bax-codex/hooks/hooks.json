@@ -1,10 +1,31 @@
 {
   "hooks": {
-    "SessionStart": [{"matcher": "^(startup|resume|fork|clear)$", "hooks": [
-      {"type": "command", "command": "python3 \"$PLUGIN_ROOT/bootstrap.py\" lifecycle", "async": true, "timeout": 45}
-    ]}],
-    "UserPromptSubmit": [{"hooks": [
-      {"type": "command", "command": "python3 \"$PLUGIN_ROOT/bootstrap.py\" lifecycle", "async": true, "timeout": 45}
-    ]}]
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume|fork|clear)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/bootstrap.py\" lifecycle",
+            "async": true,
+            "timeout": 45,
+            "statusMessage": "Бакс: подключение разговора"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/bootstrap.py\" lifecycle",
+            "async": true,
+            "timeout": 45,
+            "statusMessage": "Бакс: проверка подключения"
+          }
+        ]
+      }
+    ]
   }
 }
