@@ -221,6 +221,7 @@ class ProjectController:
             "selected_error": self.saved.get(self.selected, {}).get("error", "") if not selected else "",
             "controller_id": self.identity,
             "controller_pid": os.getpid(),
+            "app_server": self.app.endpoint if self.app else AppServer(self.endpoint).endpoint,
             "state": "busy" if self.selected in self.compacting else selected.state if selected else "ready",
             "connected": bool(relay and relay.connected),
             "authentication": self.app.account_state if self.app else "unknown",
@@ -393,6 +394,25 @@ class ProjectController:
         bridge.turn_id = await self.app.active_turn(thread_id) if bridge.state in {"busy", "waiting"} else ""
         self.catalog[thread_id] = thread
         return bridge
+
+    async def session_opened(self, thread_id: str) -> dict:
+        """Регистрация из hook: фоновые разговоры не меняют выбор телефона."""
+        async with self.lock:
+            if not self.app or self.app.closed.is_set():
+                raise RPCError("Codex пока недоступен")
+            await self.app.inspect(thread_id, self.project)
+            if thread_id not in self.sessions or self.sessions[thread_id].state == "offline":
+                await self.ensure_session(thread_id)
+                if not self.selected:
+                    self.selected = thread_id
+                    self.template = {
+                        k: v for k, v in self.app.configurations[thread_id].items() if k in CONFIG_FIELDS
+                    }
+                    await self.publish_selection()
+                self.save()
+                if self.relay and self.relay.connected:
+                    await self.send_sessions()
+            return {"registered": True, "thread_id": thread_id, "selected": self.selected}
 
     async def attach(self, thread_id: str) -> dict:
         # Локальная команда явно выбирает именно переданный CODEX_THREAD_ID.

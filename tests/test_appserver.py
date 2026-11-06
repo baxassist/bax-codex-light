@@ -117,7 +117,7 @@ async def test_never_resumes_closed_thread(tmp_path):
         app = AppServer(endpoint)
         try:
             await app.open()
-            with pytest.raises(RPCError, match="не открыта"):
+            with pytest.raises(RPCError, match="не загружена в AppServer"):
                 await app.attach("current", tmp_path)
             assert not any(c["method"] == "thread/resume" for c in fake.calls)
         finally:
@@ -215,6 +215,34 @@ async def test_active_turn_lookup_reads_only_latest_turn_metadata(tmp_path):
             assert not any(
                 c["method"] in {"thread/resume", "thread/start", "turn/start", "turn/steer"}
                 for c in fake.calls
+            )
+        finally:
+            await app.close()
+
+
+async def test_unloaded_thread_reports_signed_out_backend_and_recovers(tmp_path):
+    fake = FakeApp(tmp_path)
+    fake.state = "notLoaded"
+    logged_in = fake.account
+    fake.account = {"account": None, "requiresOpenaiAuth": True}
+    async with fake.running() as endpoint:
+        app = AppServer(endpoint)
+        await app.open()
+        try:
+            with pytest.raises(RPCError, match="AppServer.*вход не выполнен"):
+                await app.inspect("current", tmp_path)
+            assert app.account_state == "signed_out"
+            assert not any(c["method"] in {"thread/resume", "account/login/start"} for c in fake.calls)
+            fake.account = logged_in
+            with pytest.raises(RPCError, match="не загружена в AppServer") as error:
+                await app.inspect("current", tmp_path)
+            assert "вход не выполнен" not in str(error.value)
+            assert app.account_state == "ready"
+            fake.state = "idle"
+            assert (await app.attach("current", tmp_path))["id"] == "current"
+            assert sum(c["method"] == "thread/resume" for c in fake.calls) == 1
+            assert all(
+                c["params"] == {"refreshToken": False} for c in fake.calls if c["method"] == "account/read"
             )
         finally:
             await app.close()

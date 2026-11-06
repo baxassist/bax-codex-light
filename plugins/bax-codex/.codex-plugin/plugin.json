@@ -1,6 +1,6 @@
 {
   "name": "bax-codex",
-  "version": "0.5.39",
+  "version": "0.5.40",
   "description": "Сессии проекта Codex и фоновая работа с телефона в Баксе",
   "repository": "https://github.com/baxassist/bax-codex-light",
   "homepage": "https://github.com/baxassist/bax-codex-light",
@@ -10,5 +10,6 @@
     "displayName": "Bax Codex Lite",
     "shortDescription": "Сессии проекта и фоновые задачи с телефона",
     "category": "Productivity"
-  }
+  },
+  "hooks": "./hooks/hooks.json"
 }

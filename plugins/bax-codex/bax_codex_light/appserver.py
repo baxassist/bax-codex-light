@@ -280,7 +280,20 @@ class AppServer:
         thread = await self.read_thread(thread_id, project)
         # systemError описывает сбой запроса в загруженном разговоре, а не его закрытие.
         if thread["status"]["type"] == "notLoaded":
-            raise RPCError("Сессия не открыта в Codex. Мост не запускает закрытые сессии")
+            # notLoaded относится к этому backend, а не ко всем окнам Codex.
+            # После /logout CLI и daemon могут иметь разное состояние входа.
+            message = (
+                "Сессия не загружена в AppServer, к которому подключён Бакс. "
+                "Она может работать в другом исполнителе Codex."
+            )
+            try:
+                await self.account_scope()
+            except AccountUnavailable:
+                if self.account_state == "signed_out":
+                    message += " В этом AppServer вход не выполнен; вход в другом CLI его не подтверждает."
+                else:
+                    message += " Состояние входа этого AppServer проверить не удалось."
+            raise RPCError(message)
         return thread
 
     async def attach(self, thread_id: str, project: Path) -> dict:

@@ -2,9 +2,18 @@
   "mcpServers": {
     "bax_codex": {
       "command": "python3",
-      "args": ["./bootstrap.py", "serve", "--auto-project"],
+      "args": [
+        "./bootstrap.py",
+        "serve",
+        "--auto-project"
+      ],
       "cwd": ".",
-      "env_vars": ["PATH", "CODEX_HOME", "CODEX_THREAD_ID"],
+      "env_vars": [
+        "PATH",
+        "CODEX_HOME",
+        "CODEX_THREAD_ID",
+        "BAX_CODEX_APP_SERVER"
+      ],
       "startup_timeout_sec": 240,
       "required": true
     }

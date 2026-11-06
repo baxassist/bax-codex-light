@@ -24,18 +24,20 @@ from bax_codex_light.project import ProjectController
 from bax_codex_light.registry import Registry
 
 
-async def test_native_empty_sessions_survive_selection_reconnect_and_archive(tmp_path, request):
-    if sys.platform not in {"darwin", "linux"} or not shutil.which("codex"):
+@pytest.mark.parametrize("cli", ["codex", os.environ.get("BAX_TEST_CURRENT_CODEX", "")])
+async def test_native_empty_sessions_survive_selection_reconnect_and_archive(tmp_path, request, cli):
+    if sys.platform not in {"darwin", "linux"} or not cli or not shutil.which(cli):
         pytest.skip("Нужен Codex CLI 0.160.0")
     version = await asyncio.create_subprocess_exec(
-        "codex",
+        cli,
         "--version",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
     stdout, _ = await asyncio.wait_for(version.communicate(), 10)
-    if b"0.160.0" not in stdout:
-        pytest.skip("Нативная проверка закреплена на Codex CLI 0.160.0")
+    expected = b"0.160.0" if cli == "codex" else b"0.166.0"
+    if expected not in stdout:
+        pytest.skip(f"Нативная проверка закреплена на Codex CLI {expected.decode()}")
     # macOS ограничивает длину Unix socket; штатный pytest tmp_path длиннее лимита.
     with (
         tempfile.TemporaryDirectory(prefix="bax-native-", dir="/tmp") as folder,
@@ -50,7 +52,7 @@ async def test_native_empty_sessions_survive_selection_reconnect_and_archive(tmp
         state = root / "controller.json"
         registry = Registry(root / "registry.json")
         process = await asyncio.create_subprocess_exec(
-            "codex",
+            cli,
             "app-server",
             "--listen",
             f"unix://{endpoint}",
@@ -156,6 +158,14 @@ async def test_native_empty_sessions_survive_selection_reconnect_and_archive(tmp
             await owner.select("new", rid="second")
             second = owner.selected
             assert second != first
+            observer = ProjectController(project, registry, root / "hook-state.json", endpoint)
+            observer.app = app
+            observer.relay = RelayStub(None)
+            await observer.session_opened(first)
+            await observer.session_opened(second)
+            await observer.session_opened(second)
+            assert observer.selected == first
+            assert set(observer.sessions) == {first, second}
             await owner.select(first, rid="return")
             assert owner.selected == first and owner.sessions[first].state == "ready"
             assert {row["session"] for row in owner.relay.frames[-1]["items"]} == {

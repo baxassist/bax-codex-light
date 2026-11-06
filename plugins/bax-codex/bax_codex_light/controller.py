@@ -87,6 +87,8 @@ async def serve_controller(project: Path, registry: Registry, endpoint: str | No
                         result = await controller.publish_to_feed(
                             params["thread_id"], params["text"], params["publication_key"]
                         )
+                    elif method == "session_opened":
+                        result = await controller.session_opened(params["thread_id"])
                     elif method == "attach":
                         result = await controller.attach(params["thread_id"])
                     elif method == "connect":
@@ -259,6 +261,8 @@ class ProjectClient:
             except ValueError as error:
                 raise RPCError("Неизвестная версия контроллера; работающий проект сохранён") from error
             if previous >= installed:
+                if status.get("app_server") != AppServer(self.endpoint).endpoint:
+                    raise RPCError("Контроллер проекта подключён к другому AppServer; его сессии сохранены")
                 return directory  # Старое окно MCP не понижает уже обновлённый контроллер.
             if (
                 status.get("state") in {"busy", "waiting"}

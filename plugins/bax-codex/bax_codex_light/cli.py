@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .appserver import AppServer
+from .appserver import AccountUnavailable, AppServer
 from .bridge import Bridge
 from .controller import ProjectClient, serve_controller
 from .mcp_server import create_server
@@ -58,6 +58,13 @@ def parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="Подключиться к выделенному агенту нынешнего типа Claude Code Lite",
             )
+    setup_parser = commands.add_parser("setup", help="Предпросмотр или установка интеграции команды codex")
+    setup_parser.add_argument("--apply", action="store_true")
+    setup_parser.add_argument("--remove", action="store_true")
+    setup_parser.add_argument("--shell", choices=("zsh", "bash"))
+    hook = commands.add_parser("lifecycle", help="Событие Codex на stdin; не вызывает модель")
+    hook.add_argument("--registry", type=Path, default=None)
+    hook.add_argument("--app-server", default=os.environ.get("BAX_CODEX_APP_SERVER"))
     return root
 
 
@@ -67,13 +74,20 @@ async def doctor(args) -> dict:
     app = AppServer(args.app_server)
     try:
         await app.open()
-        thread = await app.inspect(args.thread, args.project)
+        thread = await app.read_thread(args.thread, args.project)
+        try:
+            await app.account_scope()
+        except AccountUnavailable:
+            pass
+        loaded = thread["status"]["type"] != "notLoaded"
         history_ok = None
         if args.check_history:
             await app.items(args.thread, None, 1)
             history_ok = True
         return {
-            "ok": True,
+            "ok": loaded and app.account_state == "ready",
+            "loaded": loaded,
+            "authentication": app.account_state,
             "project": str(args.project.resolve()),
             "thread_id": thread["id"],
             "state": thread["status"]["type"],
@@ -91,12 +105,29 @@ def main() -> None:
     args = parser().parse_args()
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(asctime)s %(name)s: %(message)s")
     try:
+        if args.command == "setup":
+            from .integration import remove, setup
+
+            action = remove if args.remove else setup
+            print(json.dumps(action(apply=args.apply, shell=args.shell), ensure_ascii=False, indent=2))
+            return
+        if args.command == "lifecycle":
+            from .lifecycle import register_event
+
+            event = json.loads(sys.stdin.read(1024 * 1024))
+            result = asyncio.run(register_event(event, Registry(args.registry), args.app_server))
+            if result.get("reason") == "backend_unavailable":
+                print("Бакс: разговор пока недоступен; повтор при следующем сообщении", file=sys.stderr)
+            return
         if not args.project.is_dir():
             raise ValueError("Каталог проекта не существует")
         registry = Registry(args.registry)
         if args.command == "connect":
             key = sys.stdin.readline().strip() if args.key_stdin else getpass.getpass("Ключ агента Бакса: ")
             registration = Registration.from_key(key, args.server, compatibility=args.compat_claude_lite)
+            previous = registry.get(args.project)
+            if previous and previous.agent != registration.agent:
+                raise ValueError("Проект уже подключён к другому агенту; регистрация сохранена")
             registry.put(args.project, registration)
             print(
                 json.dumps(
