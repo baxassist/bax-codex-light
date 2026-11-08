@@ -106,8 +106,10 @@ class SessionBridge(Bridge):
         await super().send_history(before, limit)
         self.owner.save()  # Прочитанная история могла подтвердить ранее неопределённую доставку.
 
-    async def send(self, frame_type: str, **fields) -> bool:
-        await self.prepare_message(frame_type, fields)
+    def view_supports(self) -> list[str]:
+        return PROJECT_SUPPORTS
+
+    async def _send_raw(self, frame_type: str, **fields) -> bool:
         # Записываем ожидающее сообщение до эха приёма на телефон.
         if frame_type == "message" and fields.get("kind") == "user":
             self.owner.save()
@@ -561,6 +563,7 @@ class ProjectController:
             thread = await self.app.new_thread(self.project, self.template, feed_prompt)
             thread_id = thread["id"]
         bridge = await self.ensure_session(thread_id, archived=archived)
+        bridge.view.enabled = getattr(self, "session_view_enabled", False)
         self.selected = thread_id
         self.template = {k: v for k, v in self.app.configurations[thread_id].items() if k in CONFIG_FIELDS}
         self.save()
@@ -568,8 +571,7 @@ class ProjectController:
         if self.relay and self.relay.connected:
             await bridge.send_history()
             await bridge.show_question()
-            await self.send("history.done", session=thread_id)
-            await bridge.send_failures()
+            await bridge.finish_history()
             await self.send_sessions()
 
     async def send_sessions(self, *, archived: bool = False, cursor: str | None = None) -> None:
@@ -635,15 +637,21 @@ class ProjectController:
                 if pending and not pending.done():
                     pending.set_result({k: v for k, v in frame.items() if k not in {"v", "type", "rid"}})
             elif kind == "subscribe":
+                self.session_view_enabled = (
+                    getattr(self, "session_view_enabled", False) or frame.get("view_protocol") == 1
+                )
                 await self.on_ready()
                 selected = self.selected
                 bridge = self.sessions.get(selected)
                 if bridge:
+                    bridge.view.enabled = self.session_view_enabled
+                    await bridge.send_view(frame.get("rid"))
                     await bridge.send_history(limit=max(1, min(int(frame.get("limit", 50)), 100)))
                     await bridge.show_question()
-                await self.send("history.done", session=selected)
                 if bridge:
-                    await bridge.send_failures()
+                    await bridge.finish_history()
+                else:
+                    await self.send("history.done", session=selected)
                 await self.send_sessions()
             elif kind == "sessions.list":
                 await self.send_sessions(archived=frame.get("archived") is True, cursor=frame.get("cursor"))

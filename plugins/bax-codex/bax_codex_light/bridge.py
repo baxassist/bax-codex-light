@@ -22,11 +22,13 @@ from .errors import failure_fields, safe_message
 from .history import History, message_id, message_key, render, stopped_entry, submission_key
 from .preferences import Preferences
 from .registry import Registration, Registry
+from .session_view import SessionView
 from .tracing import command_context, valid_parent
 
 log = logging.getLogger(__name__)
 SUPPORTS = ["subscribe", "run", "answer", "history", "files.list", "files.read", "power.get", "power.set"]
 SUPPORTS.append("attachments")
+SUPPORTS.extend(["history.done", "session.view"])
 
 
 @dataclass
@@ -88,6 +90,7 @@ class Bridge:
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.input_lock = asyncio.Lock()
+        self.view = SessionView()
 
     def status(self, thread_id: str = "") -> dict:
         if thread_id and thread_id != self.thread_id:
@@ -268,8 +271,36 @@ class Bridge:
             self.state = "offline"
 
     async def send(self, frame_type: str, **fields) -> bool:
+        await self.prepare_message(frame_type, fields)
+        self.view.observe(frame_type, fields)
+        if self.view.enabled and frame_type == "history.done":
+            fields["view"] = self.make_view(force=True)
+        sent = await self._send_raw(frame_type, **fields)
+        if self.view.enabled and frame_type != "history.done":
+            if snapshot := self.make_view():
+                await self._send_raw("session.view", view=snapshot)
+        return sent
+
+    def make_view(self, *, force=False) -> dict | None:
+        question = next(iter(self.questions.values()), None)
+        return self.view.snapshot(
+            state=self.state,
+            question=question["card"] if question else None,
+            supports=self.view_supports(),
+            force=force,
+        )
+
+    def view_supports(self) -> list[str]:
+        return SUPPORTS
+
+    async def send_view(self, rid=None) -> None:
+        if self.view.enabled:
+            await self._send_raw(
+                "session.view", view=self.make_view(force=True), **({"history_rid": rid} if rid else {})
+            )
+
+    async def _send_raw(self, frame_type: str, **fields) -> bool:
         if self.relay:
-            await self.prepare_message(frame_type, fields)
             return await self.relay.send(frame_type, session=self.thread_id, **fields)
         return False
 
@@ -393,10 +424,14 @@ class Bridge:
             await self.send("message", **row)
 
     async def send_failures(self) -> None:
+        baseline = self.view.revision
         try:
             turns = await self.app.recent_turns(self.thread_id)
         except (RPCError, OSError, TimeoutError):
             turns = []
+        resolved = self.view.reconcile_turns(turns, baseline)
+        for identity in resolved:
+            self.failures.pop(identity, None)
         sent = set()
         for turn in turns:
             if not turn.get("error") or (turn["id"] not in self.history_turns and turn != turns[-1]):
@@ -410,6 +445,15 @@ class Bridge:
                 await self.send("error", **fields)
         if self.codex_status == "systemError" and not turns and not self.last_failure:
             await self.send_turn_failure()
+
+    async def finish_history(self) -> None:
+        # Старые клиенты получают прежний порядок; новый снимок включает ошибки
+        # до явного завершения, чтобы телефон применил одно состояние.
+        if self.view.enabled:
+            await self.send_failures()
+        await self.send("history.done")
+        if not self.view.enabled:
+            await self.send_failures()
 
     async def send_turn_failure(self, turn: dict | None = None, *, will_retry: bool = False) -> None:
         if turn is None:
@@ -453,19 +497,19 @@ class Bridge:
         try:
             kind = frame.get("type")
             if kind == "subscribe":
+                self.view.enabled = self.view.enabled or frame.get("view_protocol") == 1
                 await self.on_ready()
+                await self.send_view(frame.get("rid"))
                 await self.send_history(limit=max(1, min(int(frame.get("limit", 50)), 100)))
                 await self.show_question()
                 await self.send("background", tasks=[])
                 await self.send("status", state=self.state)
-                await self.send("history.done")
-                await self.send_failures()
+                await self.finish_history()
             elif kind == "history":
                 await self.send_history(
                     int(frame.get("before", 0)), max(1, min(int(frame.get("limit", 50)), 100))
                 )
-                await self.send("history.done")
-                await self.send_failures()
+                await self.finish_history()
             elif kind == "run":
                 await self.accept_run(frame)
                 await self._drain()

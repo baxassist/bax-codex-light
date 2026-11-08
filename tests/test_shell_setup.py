@@ -172,6 +172,7 @@ def test_manual_launcher_changes_are_preserved(shell_home):
 
 
 def test_hook_upgrade_preserves_rc_and_never_downgrades(shell_home, monkeypatch):
+    monkeypatch.setattr(integration, "__version__", "0.5.40")
     integration.setup(apply=True)
     rc = shell_home / ".zshrc"
     before = rc.read_bytes()

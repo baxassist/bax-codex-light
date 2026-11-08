@@ -87,6 +87,33 @@ def bridge(tmp_path):
     return result
 
 
+async def test_opted_in_history_contains_final_control_snapshot_and_reconciles_native_success(tmp_path):
+    b = bridge(tmp_path)
+    b.state = "ready"
+    await b.send_turn_failure({"id": "turn", "error": {"message": "Старый сбой"}})
+    b.app.history_items = [entry("answer", text="Готовый ответ")]
+
+    async def completed(thread_id):
+        return [{"id": "turn", "status": "completed", "error": None}]
+
+    b.app.recent_turns = completed
+    await b.on_frame({"type": "subscribe", "rid": "current-read", "view_protocol": 1})
+    done = next(f for f in reversed(b.relay.sent) if f["type"] == "history.done")
+    assert done["view"]["failures"] == []
+    assert done["view"]["question"] is None
+    assert "run" in done["view"]["actions"]
+    assert not b.failures
+    initial = next(
+        f for f in b.relay.sent if f["type"] == "session.view" and f.get("history_rid") == "current-read"
+    )
+    assert initial["view"]["revision"] < done["view"]["revision"]
+    await b.send_turn_failure({"id": "next", "error": {"message": "Новая ошибка"}})
+    live = b.relay.sent[-1]
+    assert live["type"] == "session.view"
+    assert live["view"]["revision"] > done["view"]["revision"]
+    assert [f["message"] for f in live["view"]["failures"]] == ["Новая ошибка"]
+
+
 async def test_live_reused_item_id_updates_only_its_turn_and_matches_history(tmp_path):
     b = bridge(tmp_path)
     b.metadata_retry_delays = ()

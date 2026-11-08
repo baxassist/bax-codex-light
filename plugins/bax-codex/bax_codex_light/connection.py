@@ -92,7 +92,12 @@ class Relay:
         if not self.connected or self.ws is None:
             return False
         try:
-            if (rid := _history_rid.get()) and frame_type in {"message", "history.done", "error"}:
+            if (rid := _history_rid.get()) and frame_type in {
+                "message",
+                "history.done",
+                "error",
+                "session.view",
+            }:
                 fields["history_rid"] = rid
             await self.ws.send(frame(frame_type, **response_fields(fields)))
             return True
