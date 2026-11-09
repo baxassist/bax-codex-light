@@ -8,7 +8,10 @@ from bax_codex_light.appserver import RPCRejected
 
 
 @pytest.mark.parametrize("waiting", [False, True])
-async def test_busy_comment_uses_current_turn_immediately_without_granting_permission(tmp_path, waiting):
+@pytest.mark.parametrize("voice", [False, True])
+async def test_busy_comment_uses_current_turn_immediately_without_granting_permission(
+    tmp_path, waiting, voice
+):
     b = bridge(tmp_path)
     b.app.active_turn_id = "active-turn"
     if waiting:
@@ -18,12 +21,33 @@ async def test_busy_comment_uses_current_turn_immediately_without_granting_permi
 
         b.app.inspect = inspect
     b.questions = {"pending": {"card": {"kind": "permission"}, "request_id": 42}}
-    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Уточнение: использовать Wi-Fi"})
+    cid, job = str(uuid4()), str(uuid4())
+    frame = {"client_id": cid, "type": "run", "text": "Уточнение: использовать Wi-Fi"}
+    if voice:
+        frame.update(voice_job_id=job, rid=job)
+    await b.on_frame(frame)
     assert b.app.steers[0][:3] == ("current", "active-turn", "Уточнение: использовать Wi-Fi")
     assert not b.app.calls and not b.queue
     assert "pending" in b.questions and not b.app.responses
     assert b.state == ("waiting" if waiting else "busy")
     assert b.status()["delivery_errors"] == 0
+    if voice:
+        ack = next(f for f in b.relay.sent if f["type"] == "voice.accepted")
+        assert ack["rid"] == job and ack["turn_id"] == "active-turn"
+        await b.on_frame(frame)
+        assert len(b.app.steers) == 1 and not b.queue
+
+
+async def test_previously_queued_voice_can_join_current_turn_after_update(tmp_path):
+    b = bridge(tmp_path)
+    cid, job = str(uuid4()), str(uuid4())
+    await b.on_frame({"type": "run", "text": "Сохранённое голосовое", "client_id": cid, "voice_job_id": job})
+    assert len(b.queue) == 1  # Текущий ход ещё не известен, ничего не отправлено.
+    b.outbox[cid].steer_allowed = False  # Сохранённое правило старого пакета.
+    b.app.active_turn_id = "active-turn"
+    await b._drain()
+    assert b.app.steers == [("current", "active-turn", "Сохранённое голосовое", cid)]
+    assert not b.queue and not b.app.calls
 
 
 async def test_live_comments_keep_order_and_are_not_independent_turns(tmp_path):
@@ -39,7 +63,8 @@ async def test_live_comments_keep_order_and_are_not_independent_turns(tmp_path):
 
 
 @pytest.mark.parametrize("next_state", ["active", "idle"])
-async def test_steer_race_rechecks_exact_turn_after_explicit_rejection(tmp_path, next_state):
+@pytest.mark.parametrize("voice", [False, True])
+async def test_steer_race_rechecks_exact_turn_after_explicit_rejection(tmp_path, next_state, voice):
     b = bridge(tmp_path)
     b.turn_id = "old-turn"
     attempts = []
@@ -53,7 +78,10 @@ async def test_steer_race_rechecks_exact_turn_after_explicit_rejection(tmp_path,
         return {"turnId": turn_id}
 
     b.app.steer_turn = steer
-    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Важное уточнение"})
+    frame = {"client_id": str(uuid4()), "type": "run", "text": "Важное уточнение"}
+    if voice:
+        frame["voice_job_id"] = str(uuid4())
+    await b.on_frame(frame)
     if next_state == "active":
         assert [call[1] for call in attempts] == ["old-turn", "new-turn"]
         assert attempts[0][3] == attempts[1][3]
@@ -83,7 +111,8 @@ async def test_repeated_explicit_rejection_retains_queue_with_clear_notice(tmp_p
     assert not b.queue
 
 
-async def test_uncertain_live_delivery_is_never_replayed(tmp_path):
+@pytest.mark.parametrize("voice", [False, True])
+async def test_uncertain_live_delivery_is_never_replayed(tmp_path, voice):
     b = bridge(tmp_path)
     b.turn_id = "turn"
     calls = []
@@ -93,7 +122,10 @@ async def test_uncertain_live_delivery_is_never_replayed(tmp_path):
         raise TimeoutError()
 
     b.app.steer_turn = timeout
-    await b.on_frame({"client_id": str(uuid4()), "type": "run", "text": "Сообщение при обрыве"})
+    frame = {"client_id": str(uuid4()), "type": "run", "text": "Сообщение при обрыве"}
+    if voice:
+        frame["voice_job_id"] = str(uuid4())
+    await b.on_frame(frame)
     await b.on_frame({"type": "subscribe"})
     await b._drain()
     assert len(calls) == 1 and not b.queue and not b.app.calls

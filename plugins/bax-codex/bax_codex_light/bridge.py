@@ -640,7 +640,6 @@ class Bridge:
                 request_id=frame.get("rid"),
                 voice_job_id=voice_job_id,
                 traceparent=frame.get("traceparent") if valid_parent(frame.get("traceparent")) else None,
-                steer_allowed=not bool(voice_job_id),
                 account_scope=account_scope,
             )
             self.outbox[client_id] = submission
@@ -716,7 +715,10 @@ class Bridge:
                         continue
                     target_turn = ""
                     if self.state in {"busy", "waiting"}:
-                        if self.outbox[client_id].steer_allowed:
+                        # Способ ввода не превращает уточнение в отдельную задачу.
+                        # Учитываем также голосовые, сохранённые старой версией
+                        # с steer_allowed=False; неизвестные отправки не в queue.
+                        if self.outbox[client_id].steer_allowed or self.outbox[client_id].voice_job_id:
                             target_turn = self.turn_id or await self.app.active_turn(self.thread_id)
                         if not target_turn:
                             deferred.add(client_id)

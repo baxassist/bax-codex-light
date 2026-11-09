@@ -462,7 +462,7 @@ async def test_voice_job_has_stable_id_and_ack_after_turn_start(tmp_path):
     await b.on_frame(frame)
     assert len(b.queue) == 1
     assert not any(item["type"] == "voice.accepted" for item in b.relay.sent)
-    assert b.outbox[cid].steer_allowed is False
+    assert b.outbox[cid].steer_allowed is True
     b.app.state = "idle"
     await b._drain()
     assert b.app.calls == [("current", "голосовая задача")]
