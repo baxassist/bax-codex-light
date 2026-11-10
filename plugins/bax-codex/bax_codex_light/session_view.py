@@ -52,7 +52,13 @@ class SessionView:
                 turn_resolved = (
                     fields.get("turn_id")
                     and failure.get("turn_id") == fields["turn_id"]
-                    and failure.get("will_retry")
+                    and (
+                        failure.get("will_retry")
+                        or (
+                            failure.get("operation") == "turn"
+                            and fields.get("turn_status") in {"completed", "interrupted"}
+                        )
+                    )
                 )
                 delivery_resolved = (
                     fields.get("delivery") == "accepted"
@@ -60,13 +66,28 @@ class SessionView:
                         (fields.get("error_id") and identity == fields["error_id"])
                         or (fields.get("rid") and failure.get("rid") == fields["rid"])
                     )
-                    and (failure.get("delivery") in {"unknown", "rejected", "queued"})
+                    and (
+                        failure.get("delivery") in {"unknown", "rejected", "queued"}
+                        or failure.get("code") == "message_queued"
+                    )
                 )
-                if turn_resolved or delivery_resolved:
+                superseded = (
+                    fields.get("superseded_by_turn_id")
+                    and fields.get("error_id") == identity
+                    and failure.get("operation") == "turn"
+                    and failure.get("turn_id") != fields["superseded_by_turn_id"]
+                )
+                if turn_resolved or delivery_resolved or superseded:
                     del self.failures[identity]
                     self.failure_versions.pop(identity, None)
-        if kind == "message" and fields.get("kind") == "user" and fields.get("rid"):
+        if (
+            kind == "message"
+            and fields.get("kind") == "user"
+            and fields.get("rid")
+            and fields.get("message_id")
+        ):
             # История с точным RID является квитанцией даже после потери live ACK.
+            # Предварительное эхо outbox ещё не является native-сообщением.
             self.observe("error.resolved", {"rid": fields["rid"], "delivery": "accepted"})
 
     def reconcile_turns(self, turns: list[dict], baseline: int) -> set[str]:
@@ -78,7 +99,13 @@ class SessionView:
         resolved = {
             identity
             for identity, failure in self.failures.items()
-            if failure.get("turn_id") in completed and self.failure_versions.get(identity, 0) <= baseline
+            if (
+                failure.get("turn_id") in completed
+                or (
+                    turns and failure.get("operation") == "turn" and failure.get("turn_id") != turns[-1]["id"]
+                )
+            )
+            and self.failure_versions.get(identity, 0) <= baseline
         }
         for identity in resolved:
             del self.failures[identity]

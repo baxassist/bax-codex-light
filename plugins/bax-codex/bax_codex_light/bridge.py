@@ -429,15 +429,21 @@ class Bridge:
             turns = await self.app.recent_turns(self.thread_id)
         except (RPCError, OSError, TimeoutError):
             turns = []
+        # Снимок, начатый до live-события, не возвращает снятую ошибку и не
+        # стирает новый сбой. Следующая загрузка сверит уже актуальные исходы.
+        if self.view.revision != baseline:
+            return
         resolved = self.view.reconcile_turns(turns, baseline)
         for identity in resolved:
             self.failures.pop(identity, None)
         sent = set()
-        for turn in turns:
-            if not turn.get("error") or (turn["id"] not in self.history_turns and turn != turns[-1]):
+        # Старые неудачные ходы остаются в Codex, но после продолжения работы
+        # больше не являются текущей проблемой разговора.
+        for turn in turns[-1:]:
+            if not turn.get("error"):
                 continue
-            await self.send_turn_failure(turn)
-            sent.add(self.last_failure["error_id"])
+            fields = await self.send_turn_failure(turn)
+            sent.add(fields["error_id"])
         if turns and not turns[-1].get("error"):
             self.last_failure = None
         for key, fields in self.failures.copy().items():
@@ -455,7 +461,7 @@ class Bridge:
         if not self.view.enabled:
             await self.send_failures()
 
-    async def send_turn_failure(self, turn: dict | None = None, *, will_retry: bool = False) -> None:
+    async def send_turn_failure(self, turn: dict | None = None, *, will_retry: bool = False) -> dict:
         if turn is None:
             try:
                 turn = await self.app.last_turn_failure(self.thread_id)
@@ -477,6 +483,7 @@ class Bridge:
             if len(self.failures) > 100:
                 self.failures.pop(next(iter(self.failures)))
         await self.send("error", **fields)
+        return fields
 
     async def send_failure(
         self,
@@ -966,6 +973,10 @@ class Bridge:
         elif method == "turn/started":
             self.last_failure = None
             self.turn_id = params["turn"]["id"]
+            for identity, failure in list(self.failures.items()):
+                if failure.get("turn_id") != self.turn_id:
+                    del self.failures[identity]
+                    await self.send("error.resolved", error_id=identity, superseded_by_turn_id=self.turn_id)
             self.state = "busy"
             await self.send("status", state=self.state)
             await self._drain()
@@ -988,7 +999,12 @@ class Bridge:
                 await self.send_turn_failure(params["turn"])
             else:
                 self.last_failure = None
-                await self.send("error.resolved", turn_id=params.get("turn", {}).get("id", ""))
+                for identity, failure in list(self.failures.items()):
+                    if failure.get("turn_id") == turn.get("id"):
+                        del self.failures[identity]
+                await self.send(
+                    "error.resolved", turn_id=turn.get("id", ""), turn_status=turn.get("status", "completed")
+                )
             self.turn_id = ""
             # Асинхронный вопрос остаётся доступным и после завершения хода.
             for request_id, request in list(self.requests.items()):

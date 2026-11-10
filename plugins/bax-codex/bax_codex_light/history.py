@@ -109,10 +109,17 @@ class History:
         return self.previews[client_id]
 
     async def page(self, before: int | None = None, limit: int = 50) -> list[dict]:
+        # Первая строка клиента может прийти из live, а не из страницы. То же
+        # происходит, когда последовательные шаги сворачиваются в одну строку.
+        # Native-курсор восстанавливаем по точной паре turn/item, не по позиции.
+        anchor = None
+        preview_boundary = before is not None and before in self.previews.values()
         if before is not None and before not in self.cursors:
+            anchor = next((key for key, value in self.ids.items() if value == before), None)
+        if before is not None and before not in self.cursors and anchor is None and not preview_boundary:
             raise ValueError("Неизвестный курсор истории; заново откройте переписку")
         cursor = self.cursors.get(before) if before is not None else None
-        if before is not None and cursor is None:
+        if before is not None and cursor is None and anchor is None and not preview_boundary:
             return []
         entries: list[dict] = []
         conversation_count = 0
@@ -120,11 +127,25 @@ class History:
         for _ in range(20):
             result = await self.app.items(self.thread_id, next_cursor, 100)
             batch = result.get("data", [])
+            if anchor is not None:
+                index = next(
+                    (i for i, e in enumerate(batch) if message_key(e["turnId"], e["item"]["id"]) == anchor),
+                    None,
+                )
+                if index is None:
+                    batch = []
+                else:
+                    batch = batch[index + 1 :]
+                    anchor = None
             entries.extend(batch)
             conversation_count += sum(e["item"].get("type") in {"userMessage", "agentMessage"} for e in batch)
             next_cursor = result.get("nextCursor")
             if not next_cursor or conversation_count >= limit:
                 break
+        if anchor is not None:
+            # Не подменяем неизвестный исход пустой страницей: клиент иначе
+            # решит, что более ранних сообщений нет.
+            raise ValueError("Сообщение ещё не доступно в истории Codex; обновите переписку")
         # Страницы могут перекрываться, если между запросами добавились события.
         unique, seen = [], set()
         for entry in entries:
@@ -203,8 +224,12 @@ class History:
                     rows.append({**row, "kind": "steps", "count": 1})
             else:
                 rows.append(row)
+        if preview_boundary:
+            rows = [row for row in rows if row["id"] < before]
         if rows:
             self.cursors[rows[0]["id"]] = next_cursor
+        elif before is not None and next_cursor is None:
+            self.cursors[before] = None
         return rows
 
     def _rebase(self) -> None:

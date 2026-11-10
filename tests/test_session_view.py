@@ -12,7 +12,7 @@ def test_source_resolves_only_exact_delivery_and_places_failure_at_its_turn():
     for rid in ("a", "b"):
         view.observe("error", {"error_id": rid, "rid": rid, "delivery": "unknown", "turn_id": rid})
     view.observe("message", {"kind": "assistant", "id": 30, "message_id": "native", "turn_id": "b"})
-    view.observe("message", {"kind": "user", "rid": "a"})
+    view.observe("message", {"kind": "user", "rid": "a", "message_id": "native-user"})
     value = snapshot(view)
     assert len(value["failures"]) == 1
     assert value["failures"][0]["rid"] == "b"
