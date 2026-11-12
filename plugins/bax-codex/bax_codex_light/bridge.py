@@ -1344,11 +1344,14 @@ class Bridge:
             await self.submit_async_answer(request)
         else:
             await self.app.respond(request_id, result)
-            for answered_id in request["question_ids"]:
-                await self.send("question.resolved", question_id=answered_id, delivery="accepted")
         self.requests.pop(request_id, None)
         for other in request["question_ids"]:
             self.questions.pop(other, None)
+        # send публикует и session.view: подтверждённый RPC сначала меняет
+        # источник карточки. При ошибке respond вопрос остаётся выше нетронутым.
+        if request["method"] != "agentMessage/asyncQuestion":
+            for answered_id in request["question_ids"]:
+                await self.send("question.resolved", question_id=answered_id, delivery="accepted")
         await self.show_question()
 
     async def submit_async_answer(self, request: dict) -> None:

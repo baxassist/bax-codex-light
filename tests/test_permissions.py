@@ -228,3 +228,75 @@ async def test_permission_reply_matches_native_0160_schema(tmp_path, native_appr
     result = b.app.responses[-1][1]
     jsonschema.validate(result, native_approval_schemas["Response"])
     assert result["scope"] == "turn"
+
+
+@pytest.mark.parametrize("remaining", [False, True])
+@pytest.mark.parametrize("kind", ["command", "permissions"])
+async def test_accepted_answer_publishes_current_question_view_once(tmp_path, remaining, kind):
+    b = bridge(tmp_path)
+    b.view.enabled = True
+    b.state = "waiting"
+    request = (
+        (lambda request_id: approval(request_id=request_id))
+        if kind == "command"
+        else (lambda request_id: access_request(tmp_path, request_id=request_id))
+    )
+    await b.on_event(request(88))
+    qid = next(iter(b.questions))
+    if remaining:
+        await b.on_event(request(89))
+    before = [f for f in b.relay.sent if f["type"] == "session.view"][-1]["view"]
+    await b.answer({"question_id": qid, "verdict": "allow"})
+    views = [f["view"] for f in b.relay.sent if f["type"] == "session.view"]
+    current = views[-1]
+    assert current["revision"] > before["revision"]
+    assert qid not in b.questions
+    if remaining:
+        assert current["question"]["question_id"] == next(iter(b.questions))
+        assert "answer" in current["actions"]
+    else:
+        assert current["question"] is None
+        assert "answer" not in current["actions"]
+    assert len(b.app.responses) == 1
+    assert (
+        len(
+            [
+                f
+                for f in b.relay.sent
+                if f["type"] == "question.resolved"
+                and f["question_id"] == qid
+                and f.get("delivery") == "accepted"
+            ]
+        )
+        == 1
+    )
+    with pytest.raises(ValueError):
+        await b.answer({"question_id": qid, "verdict": "allow"})
+    assert len(b.app.responses) == 1
+    assert [f["view"] for f in b.relay.sent if f["type"] == "session.view"] == views
+    # Повторная подписка читает уже очищенный источник, не воскрешает отвеченную карточку.
+    snapshot = b.make_view(force=True)
+    assert snapshot["question"] == current["question"]
+
+
+@pytest.mark.parametrize("failure", ["invalid-verdict", "rpc-error"])
+async def test_rejected_answer_keeps_source_question_without_accepted_view(tmp_path, failure):
+    b = bridge(tmp_path)
+    b.view.enabled = True
+    b.state = "waiting"
+    await b.on_event(access_request(tmp_path))
+    qid = next(iter(b.questions))
+    before = list(b.relay.sent)
+    if failure == "rpc-error":
+
+        async def reject(*args):
+            raise RuntimeError("synthetic RPC refusal")
+
+        b.app.respond = reject
+    with pytest.raises((ValueError, RuntimeError)):
+        await b.answer(
+            {"question_id": qid, "verdict": "invalid" if failure == "invalid-verdict" else "allow"}
+        )
+    assert qid in b.questions and 88 in b.requests
+    assert b.relay.sent == before
+    assert not b.app.responses
