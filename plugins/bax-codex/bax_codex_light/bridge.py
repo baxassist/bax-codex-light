@@ -485,6 +485,18 @@ class Bridge:
         await self.send("error", **fields)
         return fields
 
+    async def resolve_turn_retry(self, turn_id: str) -> None:
+        if not turn_id:
+            return
+        for identity, failure in list(self.view.failures.items()):
+            if (
+                failure.get("operation") == "turn"
+                and failure.get("turn_id") == turn_id
+                and failure.get("will_retry")
+            ):
+                await self.send("error.resolved", error_id=identity, turn_id=turn_id)
+                return
+
     async def send_failure(
         self,
         code: str,
@@ -973,11 +985,16 @@ class Bridge:
         elif method == "turn/started":
             self.last_failure = None
             self.turn_id = params["turn"]["id"]
-            for identity, failure in list(self.failures.items()):
-                if failure.get("turn_id") != self.turn_id:
-                    del self.failures[identity]
-                    await self.send("error.resolved", error_id=identity, superseded_by_turn_id=self.turn_id)
             self.state = "busy"
+            for identity, failure in (self.view.failures | self.failures).items():
+                if failure.get("operation") == "turn" and failure.get("turn_id") != self.turn_id:
+                    self.failures.pop(identity, None)
+                    await self.send(
+                        "error.resolved",
+                        error_id=identity,
+                        turn_id=failure.get("turn_id", ""),
+                        superseded_by_turn_id=self.turn_id,
+                    )
             await self.send("status", state=self.state)
             await self._drain()
         elif method == "turn/completed":
@@ -1025,6 +1042,8 @@ class Bridge:
                 await self.async_questions(item, params["turnId"])
             view = render(item)
             if view and view[1]:
+                if method == "item/completed" and view[0] == "assistant" and view[1].strip():
+                    await self.resolve_turn_retry(params["turnId"])
                 item_id = submission_key(item)
                 if item.get("type") == "userMessage":
                     await self.resolve_structured_answers(view[1])
@@ -1066,6 +1085,8 @@ class Bridge:
                 if method == "item/completed" and view[0] == "assistant" and params.get("turnId"):
                     self.refresh_reply_metadata(item, params["turnId"], entry_id, view[1], metadata)
         elif method == "item/agentMessage/delta" and self.history:
+            if params["delta"].strip():
+                await self.resolve_turn_retry(params["turnId"])
             item_id = params["itemId"]
             entry_id = self.history.live_id(item_id, params["turnId"])
             self.streamed.add(message_key(params["turnId"], item_id))

@@ -10,6 +10,90 @@ from test_history import Pages
 from bax_codex_light.history import History, message_id
 
 
+async def provider_retry(b, turn="turn", *, will_retry=True):
+    await b.on_event(
+        {
+            "method": "error",
+            "params": {
+                "threadId": "current",
+                "turnId": turn,
+                "willRetry": will_retry,
+                "error": {
+                    "message": "Reconnecting... 1/5" if will_retry else "Соединение не восстановилось",
+                    "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}},
+                },
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("method", ["item/agentMessage/delta", "item/completed"])
+async def test_same_turn_retry_clears_on_native_answer_and_stays_cleared_on_subscribe(tmp_path, method):
+    b = bridge(tmp_path)
+    b.view.enabled = True
+    b.state = "busy"
+    b.metadata_retry_delays = ()
+    await provider_retry(b)
+    await b.send_failure(
+        "delivery_uncertain", "Нет квитанции", operation="run", rid="pending", delivery="unknown"
+    )
+    await b.on_event(
+        {"method": "thread/status/changed", "params": {"threadId": "current", "status": {"type": "active"}}}
+    )
+    b.app.history_items = [entry("old", text="Ответ из истории")]
+    await b.on_frame({"type": "subscribe", "view_protocol": 1})
+    assert any(f["will_retry"] for f in b.make_view(force=True)["failures"])
+
+    common = {"threadId": "current", "turnId": "turn", "itemId": "resumed"}
+    await b.on_event({"method": "item/agentMessage/delta", "params": {**common, "delta": " "}})
+    await b.on_event(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {**common, "turnId": "foreign", "delta": "Другой ход"},
+        }
+    )
+    assert any(f["will_retry"] for f in b.make_view(force=True)["failures"])
+
+    frames_before = len(b.relay.sent)
+    await b.on_event(
+        {
+            "method": method,
+            "params": {
+                **common,
+                "delta": "Ответ продолжился",
+                "item": {"id": "resumed", "type": "agentMessage", "text": "Ответ продолжился"},
+            },
+        }
+    )
+    frames = b.relay.sent[frames_before:]
+    resolved = next((f for f in frames if f["type"] == "error.resolved"), None)
+    assert resolved is not None, "После нового фрагмента источник должен снять автоповтор"
+    assert resolved["turn_id"] == "turn"
+    assert resolved["error_id"] == "turn:turn:codex_turn_failed"
+    view = next(f["view"] for f in reversed(frames) if f["type"] == "session.view")
+    assert view["state"] == "busy" and [f["rid"] for f in view["failures"]] == ["pending"]
+    assert not b.app.calls and not b.app.steers
+
+    await b.on_frame({"type": "subscribe", "view_protocol": 1})
+    history = next(f for f in reversed(b.relay.sent) if f["type"] == "history.done")
+    assert [f["rid"] for f in history["view"]["failures"]] == ["pending"]
+
+    await provider_retry(b, will_retry=False)
+    await b.on_event({"method": "item/agentMessage/delta", "params": {**common, "delta": "Запоздавший кадр"}})
+    failure = next(f for f in b.make_view(force=True)["failures"] if f.get("turn_id") == "turn")
+    assert not failure["will_retry"] and "Соединение не восстановилось" in failure["message"]
+
+
+async def test_new_native_turn_supersedes_transient_retry_in_source_and_legacy_frames(tmp_path):
+    b = bridge(tmp_path)
+    b.view.enabled = True
+    await provider_retry(b)
+    await b.on_event({"method": "turn/started", "params": {"threadId": "current", "turn": {"id": "next"}}})
+    assert b.make_view(force=True)["failures"] == []
+    resolved = next(f for f in reversed(b.relay.sent) if f["type"] == "error.resolved")
+    assert resolved["turn_id"] == "turn" and resolved["superseded_by_turn_id"] == "next"
+
+
 async def test_queue_notice_resolves_by_exact_receipt_in_source_snapshot(tmp_path):
     b = bridge(tmp_path)
     b.view.enabled = True
