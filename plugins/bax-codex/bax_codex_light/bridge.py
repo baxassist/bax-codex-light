@@ -520,7 +520,7 @@ class Bridge:
                 await self.on_ready()
                 await self.send_view(frame.get("rid"))
                 await self.send_history(limit=max(1, min(int(frame.get("limit", 50)), 100)))
-                await self.show_question()
+                await self.show_question(replay=True)
                 await self.send("background", tasks=[])
                 await self.send("status", state=self.state)
                 await self.finish_history()
@@ -1265,11 +1265,13 @@ class Bridge:
             }
         await self.show_question()
 
-    async def show_question(self) -> None:
+    async def show_question(self, *, replay: bool = False) -> None:
         # Нынешний UI Бакса показывает одну карточку; вопросы передаём по очереди.
         if self.questions:
             question = next(iter(self.questions.values()))
-            await self.send("question", **question["card"])
+            replay_fields = {"replay": True} if replay or question.get("announced") else {}
+            if await self.send("question", **question["card"], **replay_fields):
+                question["announced"] = True
 
     def async_question_details(self) -> list[dict]:
         return [

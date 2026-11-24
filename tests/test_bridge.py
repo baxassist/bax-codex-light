@@ -370,6 +370,19 @@ async def test_terminal_resolution_invalidates_phone_question(tmp_path):
     assert not b.app.responses
 
 
+async def test_new_question_then_subscribe_reuses_the_card_without_a_new_notice(tmp_path):
+    b = bridge(tmp_path)
+    await b.on_event(approval())
+    new = next(frame for frame in b.relay.sent if frame["type"] == "question")
+    assert "replay" not in new
+
+    b.relay.sent.clear()
+    for _ in range(4):
+        await b.on_frame({"type": "subscribe", "rid": str(uuid4()), "view_protocol": 1})
+    restored = [frame for frame in b.relay.sent if frame["type"] == "question"]
+    assert restored == [{**new, "replay": True}] * 4
+
+
 async def test_multiple_questions_are_displayed_one_at_a_time(tmp_path):
     b = bridge(tmp_path)
     await b.on_event(

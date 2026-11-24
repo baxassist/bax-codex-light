@@ -570,7 +570,7 @@ class ProjectController:
         await self.publish_selection(rid)
         if self.relay and self.relay.connected:
             await bridge.send_history()
-            await bridge.show_question()
+            await bridge.show_question(replay=True)
             await bridge.finish_history()
             await self.send_sessions()
 
@@ -647,7 +647,7 @@ class ProjectController:
                     bridge.view.enabled = self.session_view_enabled
                     await bridge.send_view(frame.get("rid"))
                     await bridge.send_history(limit=max(1, min(int(frame.get("limit", 50)), 100)))
-                    await bridge.show_question()
+                    await bridge.show_question(replay=True)
                 if bridge:
                     await bridge.finish_history()
                 else:
