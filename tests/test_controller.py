@@ -1,4 +1,8 @@
 import asyncio
+import json
+import os
+import subprocess
+import sys
 
 import pytest
 from conftest import until
@@ -8,6 +12,40 @@ from websockets.exceptions import WebSocketException
 from bax_codex_light.appserver import RPCError
 from bax_codex_light.controller import ProjectClient, private_directory, request, runtime_path
 from bax_codex_light.registry import Registry
+
+
+@pytest.mark.parametrize("use_project_environment", [False, True])
+def test_cli_uses_known_project_after_inherited_directory_is_removed(tmp_path, use_project_environment):
+    deleted = tmp_path / "deleted-cwd"
+    deleted.mkdir()
+    registry = tmp_path / "registry.json"
+    env = dict(os.environ)
+    env.pop("BAX_CODEX_PROJECT", None)
+    argv = ["status", "--registry", str(registry)]
+    if use_project_environment:
+        env["BAX_CODEX_PROJECT"] = str(tmp_path)
+    else:
+        argv.extend(["--project", str(tmp_path)])
+    program = """\
+import os
+import sys
+from bax_codex_light.cli import main
+
+directory = sys.argv.pop(1)
+os.chdir(directory)
+os.rmdir(directory)
+main()
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", program, str(deleted), *argv],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout) == {"registered": False, "project": str(tmp_path), "engine": None}
 
 
 async def test_two_mcps_share_one_owner_and_eof_keeps_selection(tmp_path):
@@ -91,6 +129,7 @@ async def test_upgrade_preserves_selection_and_never_interrupts_busy_owner(tmp_p
         original_run = controller.subprocess.run
 
         def checked_import(*args, **kwargs):
+            assert kwargs["cwd"] == tmp_path
             loop.call_soon_threadsafe(import_started.set)
             return original_run(*args, **kwargs)
 

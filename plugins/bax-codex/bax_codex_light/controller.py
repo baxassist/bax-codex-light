@@ -277,6 +277,7 @@ class ProjectClient:
                 checked = await asyncio.to_thread(
                     subprocess.run,
                     [sys.executable, "-c", "from bax_codex_light.controller import serve_controller"],
+                    cwd=self.project,
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -320,6 +321,7 @@ class ProjectClient:
             await asyncio.to_thread(
                 subprocess.Popen,
                 args,
+                cwd=self.project,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=log,

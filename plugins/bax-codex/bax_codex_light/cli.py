@@ -25,9 +25,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     for command in ("connect", "status", "doctor", "serve", "controller"):
         child = commands.add_parser(command)
-        child.add_argument(
-            "--project", type=Path, default=Path(os.environ.get("BAX_CODEX_PROJECT", os.getcwd()))
-        )
+        child.add_argument("--project", type=Path, default=os.environ.get("BAX_CODEX_PROJECT"))
         child.add_argument("--registry", type=Path, default=None)
         if command in {"serve", "doctor", "controller"}:
             child.add_argument(
@@ -119,6 +117,8 @@ def main() -> None:
             if result.get("reason") == "backend_unavailable":
                 print("Бакс: разговор пока недоступен; повтор при следующем сообщении", file=sys.stderr)
             return
+        if args.project is None:
+            args.project = Path.cwd()
         if not args.project.is_dir():
             raise ValueError("Каталог проекта не существует")
         registry = Registry(args.registry)
